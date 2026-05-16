@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.drizzle/
+storage/shop-website-assets/**
+!storage/shop-website-assets/.gitkeep
