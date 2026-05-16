@@ -1,6 +1,16 @@
 import nodemailer from 'nodemailer';
 import { env } from '../config/env.js';
 
+function escapeHtml(unsafe: string | null | undefined): string {
+  if (!unsafe) return '';
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 type MailConfig = {
   host: string;
   port: number;
@@ -346,12 +356,4 @@ export async function sendOrderConfirmationEmail(opts: {
     shopSettings: opts.shopSettings,
     fallbackName: opts.shopName,
   });
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
