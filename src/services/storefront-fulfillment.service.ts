@@ -72,7 +72,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
 
   if (shipId) {
     const [addr] = await db
-      .select({ id: customerAddresses.id, address: customerAddresses.address })
+      .select({ id: customerAddresses.id, address: customerAddresses.line1 })
       .from(customerAddresses)
       .where(
         and(
@@ -133,7 +133,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
     mergedQty.set(raw.productId, (mergedQty.get(raw.productId) ?? 0) + q);
   }
 
-  const resolvedLines: { productId: string; qty: string; unitPrice: string }[] = [];
+  const resolvedLines: { productId: string; name: string; qty: string; unitPrice: string }[] = [];
 
   for (const [productId, q] of mergedQty) {
     const [row] = await db
@@ -157,7 +157,12 @@ export async function placeStorefrontFulfillmentOrder(input: {
     if (!row) {
       throw AppError.badRequest('One or more products are not available on this shop’s website');
     }
-    resolvedLines.push({ productId: row.id, name: row.name, qty: String(q), unitPrice: row.listPrice });
+    resolvedLines.push({
+      productId: row.id,
+      name: row.name,
+      qty: String(q),
+      unitPrice: row.listPrice,
+    });
   }
 
   const orderRow = await db.transaction(async (tx) => {
