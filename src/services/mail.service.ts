@@ -68,7 +68,7 @@ function readMailConfigFromShopSettings(settings: unknown): Partial<MailConfig> 
   };
 }
 
-function resolveMailConfig(shopSettings?: unknown): MailConfig | null {
+function resolveMailConfig(shopSettings?: unknown, fallbackName?: string): MailConfig | null {
   const base = readMailConfigFromEnv();
   const override = shopSettings ? readMailConfigFromShopSettings(shopSettings) : null;
   if (!override) return base;
@@ -80,7 +80,7 @@ function resolveMailConfig(shopSettings?: unknown): MailConfig | null {
     username: override.username ?? base?.username ?? '',
     password: override.password ?? base?.password ?? '',
     fromAddress: override.fromAddress ?? base?.fromAddress ?? '',
-    fromName: override.fromName ?? base?.fromName ?? env.MAIL_FROM_NAME,
+    fromName: override.fromName ?? fallbackName ?? base?.fromName ?? env.MAIL_FROM_NAME,
   };
 
   if (!merged.host || !merged.username || !merged.password || !merged.fromAddress) {
@@ -99,8 +99,9 @@ export async function sendMail(opts: {
   html: string;
   text?: string;
   shopSettings?: unknown;
+  fallbackName?: string;
 }): Promise<void> {
-  const cfg = resolveMailConfig(opts.shopSettings);
+  const cfg = resolveMailConfig(opts.shopSettings, opts.fallbackName);
   if (!cfg) {
     throw new Error('Mail is not configured (set MAIL_HOST, MAIL_USERNAME, MAIL_PASSWORD, MAIL_FROM_ADDRESS)');
   }
@@ -136,7 +137,8 @@ export async function sendShopRegistrationOtpEmail(opts: {
   shopName: string;
   otp: string;
 }): Promise<void> {
-  const subject = `${env.MAIL_FROM_NAME} — shop registration code`;
+  const brand = env.MAIL_FROM_NAME || 'FinsGuardian';
+  const subject = `${brand} — shop registration code`;
   const text = `Your verification code is: ${opts.otp}\n\nShop: ${opts.shopName}\n\nThis code expires in ${env.REGISTRATION_OTP_TTL_MIN} minutes.`;
   const html = `
     <p>Your verification code is:</p>
@@ -153,7 +155,8 @@ export async function sendInternalDashboardOtpEmail(opts: {
   otp: string;
   ttlMin: number;
 }): Promise<void> {
-  const subject = `${env.MAIL_FROM_NAME} — internal dashboard sign-in code`;
+  const brand = env.MAIL_FROM_NAME || 'FinsGuardian';
+  const subject = `${brand} — internal dashboard sign-in code`;
   const text = `Your sign-in code is: ${opts.otp}\n\nHello ${opts.displayName},\n\nThis code expires in ${opts.ttlMin} minutes. If you did not request this, ignore this email.`;
   const html = `
     <p>Hello <strong>${escapeHtml(opts.displayName)}</strong>,</p>
@@ -171,15 +174,178 @@ export async function sendCustomerSigninOtpEmail(opts: {
   ttlMin: number;
   shopSettings?: unknown;
 }): Promise<void> {
-  const subject = `${env.MAIL_FROM_NAME} — sign-in code`;
+  const subject = `${opts.shopName} — sign-in code`;
   const text = `Your sign-in code is: ${opts.otp}\n\nShop: ${opts.shopName}\n\nThis code expires in ${opts.ttlMin} minutes. If you did not request this, ignore this email.`;
   const html = `
-    <p>Your sign-in code is:</p>
-    <p style="font-size:28px;font-weight:700;letter-spacing:4px;">${escapeHtml(opts.otp)}</p>
-    <p>Shop: <strong>${escapeHtml(opts.shopName)}</strong></p>
-    <p style="color:#666;font-size:14px;">This code expires in ${opts.ttlMin} minutes. If you did not request this, you can ignore this email.</p>
+    <div style="font-family:sans-serif;max-width:600px;">
+      <p>Your sign-in code is:</p>
+      <p style="font-size:32px;font-weight:700;letter-spacing:4px;color:#2563eb;">${escapeHtml(opts.otp)}</p>
+      <p>Shop: <strong>${escapeHtml(opts.shopName)}</strong></p>
+      <p style="color:#666;font-size:14px;margin-top:24px;">This code expires in ${opts.ttlMin} minutes. If you did not request this, you can ignore this email.</p>
+      <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
+      <p style="color:#999;font-size:12px;">Powered by FinsGuardian</p>
+    </div>
   `.trim();
-  await sendMail({ to: opts.to, subject, text, html, shopSettings: opts.shopSettings });
+  await sendMail({
+    to: opts.to,
+    subject,
+    text,
+    html,
+    shopSettings: opts.shopSettings,
+    fallbackName: opts.shopName,
+  });
+}
+
+export async function sendOrderConfirmationEmail(opts: {
+  to: string;
+  shopName: string;
+  shopLogo?: string | null;
+  shopContact?: {
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+  } | null;
+  orderRef: string;
+  subtotal: string;
+  deliveryCharge: string;
+  total: string;
+  items: { name: string; qty: number; total: string }[];
+  customer: {
+    name: string;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+  };
+  shopSettings?: unknown;
+}): Promise<void> {
+  const subject = `${opts.shopName} — Order Confirmed #${opts.orderRef}`;
+
+  const itemsHtml = opts.items
+    .map(
+      (it) => `
+    <tr>
+      <td style="padding:12px 0;border-bottom:1px solid #f0f0f0;">
+        <div style="font-weight:600;color:#1a1a1a;">${escapeHtml(it.name)}</div>
+        <div style="font-size:13px;color:#666;">Quantity: ${it.qty}</div>
+      </td>
+      <td style="padding:12px 0;border-bottom:1px solid #f0f0f0;text-align:right;vertical-align:top;font-weight:600;color:#1a1a1a;">
+        ${it.total}
+      </td>
+    </tr>
+  `,
+    )
+    .join('');
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; color: #333; margin: 0; padding: 0; background-color: #f8fafc; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px 6px; }
+        .header { text-align: center; margin-bottom: 24px; padding-top: 10px; }
+        .logo { max-height: 50px; max-width: 180px; margin-bottom: 8px; }
+        .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .order-badge { display: inline-block; background: #f1f5f9; color: #475569; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; margin-bottom: 16px; }
+        .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin: 32px 0 12px 0; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
+        .footer { text-align: center; margin-top: 40px; color: #94a3b8; font-size: 11px; padding-bottom: 30px; }
+        
+        @media only screen and (max-width: 600px) {
+          .card { padding: 16px; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          ${opts.shopLogo ? `<img src="${opts.shopLogo}" alt="${escapeHtml(opts.shopName)}" class="logo">` : `<h1 style="margin:0;font-size:24px;font-weight:800;color:#0f172a;">${escapeHtml(opts.shopName)}</h1>`}
+        </div>
+        
+        <div class="card">
+          <div style="display:flex; justify-content: space-between; align-items: flex-start; margin-bottom: 32px;">
+            <div>
+              <div class="order-badge">Order Confirmed</div>
+              <h2 style="margin:0 0 4px 0;font-size:20px;color:#0f172a;">Thanks for your order!</h2>
+              <p style="margin:0;color:#64748b;font-size:14px;">Order <strong>#${opts.orderRef}</strong></p>
+            </div>
+            <div style="text-align: right;">
+              <div style="font-size:12px; color:#94a3b8; text-transform: uppercase; font-weight:700;">Date</div>
+              <div style="font-size:14px; color:#0f172a; font-weight:600;">${new Date().toLocaleDateString()}</div>
+            </div>
+          </div>
+
+          <div style="background: #f8fafc; border-radius: 8px; padding: 16px; margin-bottom: 32px;">
+            <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform: uppercase; letter-spacing:0.5px; margin-bottom:8px;">Shipping To</div>
+            <div style="font-size:14px; color:#0f172a; font-weight:600;">${escapeHtml(opts.customer.name)}</div>
+            <div style="font-size:13px; color:#64748b; margin-top:4px;">
+              ${opts.customer.address ? `${escapeHtml(opts.customer.address)}<br/>` : ''}
+              ${opts.customer.phone ? `${escapeHtml(opts.customer.phone)}<br/>` : ''}
+              ${opts.customer.email ? `${escapeHtml(opts.customer.email)}` : ''}
+            </div>
+          </div>
+
+          <div class="section-title">Order Items</div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr style="text-align:left; font-size:12px; color:#94a3b8;">
+                <th style="padding-bottom:12px;">Description</th>
+                <th style="text-align:right; padding-bottom:12px;">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itemsHtml}
+            </tbody>
+          </table>
+
+          <div style="margin-top:20px; border-top: 1px solid #f1f5f9; padding-top: 20px;">
+            <table style="width:100%;border-collapse:collapse;">
+              <tr>
+                <td style="color:#64748b;padding:4px 0;font-size:14px;">Subtotal</td>
+                <td style="text-align:right;color:#0f172a;padding:4px 0;font-weight:600;font-size:14px;">${opts.subtotal}</td>
+              </tr>
+              <tr>
+                <td style="color:#64748b;padding:4px 0;font-size:14px;">Delivery Fee</td>
+                <td style="text-align:right;color:#0f172a;padding:4px 0;font-weight:600;font-size:14px;">${opts.deliveryCharge}</td>
+              </tr>
+              <tr style="font-size:18px;font-weight:800;color:#0f172a;">
+                <td style="padding:12px 0 0 0; border-top: 2px solid #f1f5f9; margin-top:10px;">Total Amount</td>
+                <td style="text-align:right;padding:12px 0 0 0; border-top: 2px solid #f1f5f9; margin-top:10px; color:#2563eb;">${opts.total}</td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="margin-top:40px; padding-top: 24px; border-top: 1px dashed #e2e8f0;">
+            <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform: uppercase; letter-spacing:0.5px; margin-bottom:8px;">Contact ${escapeHtml(opts.shopName)}</div>
+            <div style="font-size:13px; color:#64748b;">
+              ${opts.shopContact?.address ? `${escapeHtml(opts.shopContact.address)}<br/>` : ''}
+              ${opts.shopContact?.phone ? `Phone: ${escapeHtml(opts.shopContact.phone)}<br/>` : ''}
+              ${opts.shopContact?.email ? `Email: ${escapeHtml(opts.shopContact.email)}` : ''}
+            </div>
+          </div>
+
+        </div>
+
+        <div class="footer">
+          <p>This is a computer generated invoice. Thank you for your business!</p>
+          <p style="margin-top:16px; font-weight:700; letter-spacing:2px; color:#cbd5e1;">POWERED BY FINSGUARDIAN</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `.trim();
+
+  const text = `Order Confirmed #${opts.orderRef}\n\nHi ${opts.customer.name},\n\nThank you for your order from ${opts.shopName}.\n\nTotal: ${opts.total}\n\nShipping to: ${opts.customer.address || 'N/A'}`;
+
+  await sendMail({
+    to: opts.to,
+    subject,
+    text,
+    html,
+    shopSettings: opts.shopSettings,
+    fallbackName: opts.shopName,
+  });
 }
 
 function escapeHtml(s: string): string {

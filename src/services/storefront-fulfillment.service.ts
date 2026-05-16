@@ -9,8 +9,10 @@ import {
   products,
   sales,
   shops,
+  shopUsers,
   storefrontFulfillmentOrderLines,
   storefrontFulfillmentOrders,
+  users,
 } from '../db/schema/index.js';
 import { AppError } from '../lib/errors.js';
 import { addMoney, mulMoney } from '../lib/money.js';
@@ -18,6 +20,7 @@ import * as shopWebsiteService from './shop-website.service.js';
 import { createHold } from './pos.service.js';
 import { isMultiStockLocationEnabled } from './shop-features.service.js';
 import { resolveLocationIdOrDefault } from './stock-location.service.js';
+import { isMailConfigured, sendOrderConfirmationEmail } from './mail.service.js';
 
 function newPublicRef(): string {
   return `WEB-${randomBytes(4).toString('hex').toUpperCase()}`;
@@ -50,19 +53,26 @@ export async function placeStorefrontFulfillmentOrder(input: {
   const deliveryLocId = input.deliveryLocationId?.trim() || null;
 
   const [custRow] = await db
-    .select({ id: customers.id })
+    .select({
+      id: customers.id,
+      email: customers.email,
+      name: customers.name,
+      phone: customers.phone,
+      address: customers.address,
+    })
     .from(customers)
     .where(and(eq(customers.id, input.customerId), eq(customers.shopId, shop.id)))
     .limit(1);
   if (!custRow) throw AppError.badRequest('Customer not found');
 
   let resolvedShippingAddressId: string | null = null;
+  let resolvedShippingAddressString: string | null = null;
   let resolvedDeliveryLocationId: string | null = null;
   let resolvedDeliveryCharge = '0';
 
   if (shipId) {
     const [addr] = await db
-      .select({ id: customerAddresses.id })
+      .select({ id: customerAddresses.id, address: customerAddresses.address })
       .from(customerAddresses)
       .where(
         and(
@@ -74,6 +84,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
       .limit(1);
     if (!addr) throw AppError.badRequest('Delivery address not found');
     resolvedShippingAddressId = addr.id;
+    resolvedShippingAddressString = addr.address;
   }
   // No saved address id: storefront does not collect address right now — optional `customers.address`
   // in DB remains for future use; fulfillment row ships with null shipping_address_id.
@@ -128,6 +139,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
     const [row] = await db
       .select({
         id: products.id,
+        name: products.name,
         listPrice: products.listPrice,
       })
       .from(products)
@@ -145,7 +157,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
     if (!row) {
       throw AppError.badRequest('One or more products are not available on this shop’s website');
     }
-    resolvedLines.push({ productId: row.id, qty: String(q), unitPrice: row.listPrice });
+    resolvedLines.push({ productId: row.id, name: row.name, qty: String(q), unitPrice: row.listPrice });
   }
 
   const orderRow = await db.transaction(async (tx) => {
@@ -177,6 +189,63 @@ export async function placeStorefrontFulfillmentOrder(input: {
 
     return order;
   });
+
+  const website = shopWebsiteService.readWebsiteSettings(shop.settings);
+
+  if (isMailConfigured(shop.settings)) {
+    const emailItems = resolvedLines.map((rl) => ({
+      name: (rl as any).name || 'Product',
+      qty: Number(rl.qty),
+      total: mulMoney(rl.qty, rl.unitPrice),
+    }));
+
+    let subtotal = '0';
+    for (const it of emailItems) subtotal = addMoney(subtotal, it.total);
+    const grandTotal = addMoney(subtotal, resolvedDeliveryCharge);
+
+    const emailOpts = {
+      shopName: shop.name,
+      shopLogo: website.logoUrl,
+      shopContact: {
+        email: website.contact.supportEmail,
+        phone: website.contact.supportPhone,
+        address: website.footer.address,
+      },
+      orderRef: orderRow.publicRef,
+      subtotal,
+      deliveryCharge: resolvedDeliveryCharge,
+      total: grandTotal,
+      items: emailItems,
+      customer: {
+        name: custRow.name,
+        email: custRow.email,
+        phone: custRow.phone,
+        address: resolvedShippingAddressString || custRow.address,
+      },
+      shopSettings: shop.settings,
+    };
+
+    // Send to customer
+    if (custRow.email) {
+      sendOrderConfirmationEmail({ ...emailOpts, to: custRow.email }).catch((err) =>
+        console.error('[storefront-fulfillment] Failed to send customer order email:', err),
+      );
+    }
+
+    // Send to shop owner
+    db.select({ email: users.email })
+      .from(shopUsers)
+      .innerJoin(users, eq(users.id, shopUsers.userId))
+      .where(and(eq(shopUsers.shopId, shop.id), eq(shopUsers.role, 'owner')))
+      .limit(1)
+      .then(([owner]) => {
+        if (owner?.email) {
+          sendOrderConfirmationEmail({ ...emailOpts, to: owner.email }).catch((err) =>
+            console.error('[storefront-fulfillment] Failed to send owner order email:', err),
+          );
+        }
+      });
+  }
 
   return { duplicate: false as const, order: orderRow };
 }
