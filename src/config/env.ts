@@ -20,6 +20,8 @@ const schema = z.object({
   CORS_ORIGIN: z.string().default('http://localhost:3000'),
   /** Public storefront URL for links in emails (defaults to CORS_ORIGIN if empty). */
   PUBLIC_APP_URL: z.string().default(''),
+  /** Public API URL for absolute asset URLs in emails. */
+  PUBLIC_API_URL: z.string().default(''),
   MAIL_MAILER: z.string().default('smtp'),
   MAIL_HOST: z.string().default(''),
   MAIL_PORT: z.coerce.number().default(465),

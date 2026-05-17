@@ -150,6 +150,25 @@ export function publicAppBaseUrl(): string {
   return u;
 }
 
+export function toAbsoluteAssetUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  const u = url.trim();
+  if (!u) return null;
+  if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:')) return u;
+
+  const base = env.PUBLIC_API_URL?.trim();
+  if (base) {
+    const cleanBase = base.replace(/\/$/, '');
+    if (u.startsWith('/')) return `${cleanBase}${u}`;
+    return `${cleanBase}/${u}`;
+  }
+
+  // Fallback in development
+  const cleanBase = `http://localhost:${env.PORT}`;
+  if (u.startsWith('/')) return `${cleanBase}${u}`;
+  return `${cleanBase}/${u}`;
+}
+
 export async function sendShopRegistrationOtpEmail(opts: {
   to: string;
   shopName: string;
@@ -237,6 +256,7 @@ export async function sendOrderConfirmationEmail(opts: {
   shopSettings?: unknown;
 }): Promise<void> {
   const subject = `${opts.shopName} — Order Confirmed #${opts.orderRef}`;
+  const absoluteLogo = toAbsoluteAssetUrl(opts.shopLogo);
 
   const itemsHtml = opts.items
     .map(
@@ -278,7 +298,7 @@ export async function sendOrderConfirmationEmail(opts: {
     <body>
       <div class="container">
         <div class="header">
-          ${opts.shopLogo ? `<img src="${opts.shopLogo}" alt="${escapeHtml(opts.shopName)}" class="logo">` : `<h1 style="margin:0;font-size:24px;font-weight:800;color:#0f172a;">${escapeHtml(opts.shopName)}</h1>`}
+          ${absoluteLogo ? `<img src="${absoluteLogo}" alt="${escapeHtml(opts.shopName)}" class="logo">` : `<h1 style="margin:0;font-size:24px;font-weight:800;color:#0f172a;">${escapeHtml(opts.shopName)}</h1>`}
         </div>
         
         <div class="card">
