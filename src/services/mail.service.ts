@@ -126,15 +126,23 @@ export async function sendMail(opts: {
       user: cfg.username,
       pass: cfg.password,
     },
+    connectionTimeout: 10000, // 10 seconds
+    greetingTimeout: 10000,   // 10 seconds
+    socketTimeout: 10000,     // 10 seconds
   });
 
-  await transporter.sendMail({
-    from: `"${cfg.fromName}" <${cfg.fromAddress}>`,
-    to: opts.to,
-    subject: opts.subject,
-    text: opts.text,
-    html: opts.html,
-  });
+  try {
+    await transporter.sendMail({
+      from: `"${cfg.fromName}" <${cfg.fromAddress}>`,
+      to: opts.to,
+      subject: opts.subject,
+      text: opts.text,
+      html: opts.html,
+    });
+  } catch (err) {
+    console.error(`[sendMail] Failed to send email to ${opts.to}:`, err);
+    throw err;
+  }
 }
 
 export function publicAppBaseUrl(): string {

@@ -33,6 +33,7 @@ export async function registerInternalAuthRoutes(app: FastifyInstance) {
           emailSent: out.registered ? Boolean(out.emailSent) : false,
         });
       } catch (e) {
+        request.log.error(e, `Error in internal dashboard request-otp endpoint for email ${request.body && (request.body as any).email}`);
         if (e instanceof z.ZodError) {
           return reply.status(400).send({
             code: 'VALIDATION_ERROR',
@@ -62,6 +63,7 @@ export async function registerInternalAuthRoutes(app: FastifyInstance) {
         const out = await internalDashboardAuth.verifyInternalDashboardOtp(body.email, body.code);
         return reply.send({ accessToken: out.accessToken });
       } catch (e) {
+        request.log.error(e, `Error in internal dashboard verify-otp endpoint for email ${request.body && (request.body as any).email}`);
         if (e instanceof z.ZodError) {
           return reply.status(400).send({
             code: 'VALIDATION_ERROR',

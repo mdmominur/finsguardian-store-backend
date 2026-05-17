@@ -103,6 +103,7 @@ export async function requestCustomerOtp(input: {
           shopSettings: shop.settings,
         });
       } catch (e: any) {
+        console.error('[requestCustomerOtp] Error sending customer OTP email:', e);
         const raw = String(e?.message ?? '').trim();
         const detail = raw ? ` (${raw})` : '';
         throw AppError.badRequest(`Failed to send OTP email${detail}`);

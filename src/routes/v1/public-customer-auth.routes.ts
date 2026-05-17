@@ -25,6 +25,7 @@ export async function registerPublicCustomerAuthRoutes(app: FastifyInstance) {
       });
       return reply.send(out);
     } catch (e) {
+      request.log.error(e, `Error in request-otp customer endpoint for shop ${String((request.params as any).slug ?? '')}`);
       if (e instanceof z.ZodError) {
         return reply.status(400).send({
           code: 'VALIDATION_ERROR',
@@ -48,6 +49,7 @@ export async function registerPublicCustomerAuthRoutes(app: FastifyInstance) {
       });
       return reply.send(out);
     } catch (e) {
+      request.log.error(e, `Error in verify-otp customer endpoint for shop ${String((request.params as any).slug ?? '')}`);
       if (e instanceof z.ZodError) {
         return reply.status(400).send({
           code: 'VALIDATION_ERROR',
