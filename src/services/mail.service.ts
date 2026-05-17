@@ -365,3 +365,36 @@ export async function sendOrderConfirmationEmail(opts: {
     fallbackName: opts.shopName,
   });
 }
+
+export async function verifyMailConfiguration(): Promise<{ success: boolean; error?: Error }> {
+  const cfg = resolveMailConfig();
+  if (!cfg) {
+    return {
+      success: false,
+      error: new Error(
+        'Mail is not configured in environment variables (MAIL_HOST, MAIL_USERNAME, MAIL_PASSWORD, MAIL_FROM_ADDRESS are required)'
+      ),
+    };
+  }
+
+  const secure = cfg.encryption === 'ssl' || cfg.port === 465;
+  const transporter = nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure,
+    auth: {
+      user: cfg.username,
+      pass: cfg.password,
+    },
+    connectionTimeout: 5000, // 5 seconds for quick startup check
+    greetingTimeout: 5000,
+    socketTimeout: 5000,
+  });
+
+  try {
+    await transporter.verify();
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err };
+  }
+}
