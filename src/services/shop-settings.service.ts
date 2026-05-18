@@ -1,4 +1,4 @@
-import { and, count, eq, ne } from 'drizzle-orm';
+import { and, count, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { shopUsers, shops, users } from '../db/schema/index.js';
 import { AppError } from '../lib/errors.js';
@@ -97,7 +97,6 @@ export async function updateShopSettings(
   shopId: string,
   input: {
     name?: string;
-    slug?: string | null;
     invoiceAddress?: string | null;
     multiStockLocationEnabled?: boolean;
     mail?: {
@@ -117,16 +116,6 @@ export async function updateShopSettings(
 ) {
   const [current] = await db.select().from(shops).where(eq(shops.id, shopId)).limit(1);
   if (!current) throw AppError.notFound('Shop not found');
-
-  if (input.slug !== undefined && input.slug !== null && input.slug.trim() !== '') {
-    const normalized = input.slug.trim().toLowerCase();
-    const [taken] = await db
-      .select({ id: shops.id })
-      .from(shops)
-      .where(and(eq(shops.slug, normalized), ne(shops.id, shopId)))
-      .limit(1);
-    if (taken) throw AppError.conflict('That slug is already used');
-  }
 
   const nextSettings = { ...readSettingsObject(current.settings) };
 
@@ -218,12 +207,8 @@ export async function updateShopSettings(
     }
   }
 
-  const setRow: { name?: string; slug?: string | null; settings?: unknown } = {};
+  const setRow: { name?: string; settings?: unknown } = {};
   if (input.name !== undefined) setRow.name = input.name.trim();
-  if (input.slug !== undefined) {
-    const s = input.slug?.trim();
-    setRow.slug = s ? s.toLowerCase() : null;
-  }
   if (settingsDirty) setRow.settings = nextSettings;
 
   if (Object.keys(setRow).length === 0) {

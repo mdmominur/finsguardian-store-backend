@@ -1,5 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { eq } from 'drizzle-orm';
+import { db } from '../../db/client.js';
+import { shops } from '../../db/schema/index.js';
 import { AppError, sendAppError } from '../../lib/errors.js';
 import * as authService from '../../services/auth.service.js';
 import * as shopRegistration from '../../services/shop-registration.service.js';
@@ -34,6 +37,29 @@ const refreshBody = z.object({
 });
 
 export async function registerAuthRoutes(app: FastifyInstance) {
+  app.get('/auth/register/check-slug', async (request, reply) => {
+    try {
+      const query = z.object({ slug: z.string().min(1) }).parse(request.query);
+      const cleanSlug = query.slug.trim().toLowerCase();
+      
+      const [existing] = await db
+        .select({ id: shops.id })
+        .from(shops)
+        .where(eq(shops.slug, cleanSlug))
+        .limit(1);
+        
+      return reply.send({ available: !existing });
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        return reply.status(400).send({
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid query parameter',
+        });
+      }
+      throw e;
+    }
+  });
+
   app.post('/auth/register/start', async (request, reply) => {
     try {
       const body = registerStartBody.parse(request.body);

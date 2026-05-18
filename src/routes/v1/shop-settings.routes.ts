@@ -6,7 +6,6 @@ import * as shopSettingsService from '../../services/shop-settings.service.js';
 
 const patchShopBody = z.object({
   name: z.string().min(1).optional(),
-  slug: z.string().nullable().optional(),
   invoiceAddress: z.string().nullable().optional(),
   multiStockLocationEnabled: z.boolean().optional(),
   deviceRegistryEnabled: z.boolean().optional(),
