@@ -7,7 +7,9 @@ async function main() {
   try {
     console.log('Adding max_users to shops...');
     await db.execute(sql`
-      ALTER TABLE shops ADD COLUMN IF NOT EXISTS max_users integer NOT NULL DEFAULT 5;
+      ALTER TABLE shops ADD COLUMN IF NOT EXISTS max_users integer NOT NULL DEFAULT 2;
+      ALTER TABLE shops ALTER COLUMN max_users SET DEFAULT 2;
+      UPDATE shops SET max_users = 2 WHERE max_users = 5;
     `);
 
     console.log('Adding payment_method_id and payout_amount to refunds...');

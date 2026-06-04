@@ -32,7 +32,7 @@ export const shops = pgTable(
     /** Last instant covered by manual subscription payments (excludes trial). */
     paidThrough: timestamp('paid_through', { withTimezone: true }),
     subscriptionStatus: text('subscription_status').notNull(),
-    maxUsers: integer('max_users').notNull().default(5),
+    maxUsers: integer('max_users').notNull().default(2),
   },
   (t) => [
     check(
