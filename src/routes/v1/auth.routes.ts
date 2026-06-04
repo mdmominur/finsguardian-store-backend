@@ -2,8 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { db } from '../../db/client.js';
-import { shops } from '../../db/schema/index.js';
+import { shops, users, refreshTokens } from '../../db/schema/index.js';
 import { AppError, sendAppError } from '../../lib/errors.js';
+import { hashPassword } from '../../lib/password.js';
+import { sendMail, publicAppBaseUrl } from '../../services/mail.service.js';
 import * as authService from '../../services/auth.service.js';
 import * as shopRegistration from '../../services/shop-registration.service.js';
 
@@ -198,4 +200,110 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       }
     },
   );
+
+  app.post('/auth/forgot-password', async (request, reply) => {
+    try {
+      const body = z.object({ email: z.string().email() }).parse(request.body);
+      const emailLower = body.email.trim().toLowerCase();
+
+      const [user] = await db
+        .select({ id: users.id, email: users.email })
+        .from(users)
+        .where(eq(users.email, emailLower))
+        .limit(1);
+
+      if (!user) {
+        // Return ok for privacy
+        return reply.send({
+          ok: true,
+          message: 'If this email exists in our system, a password reset link has been sent.',
+        });
+      }
+
+      const token = app.jwt.sign(
+        { userId: user.id, email: user.email, purpose: 'password_reset' } as any,
+        { expiresIn: '15m' }
+      );
+
+      const baseUrl = publicAppBaseUrl();
+      const resetLink = `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`;
+
+      try {
+        await sendMail({
+          to: user.email!,
+          subject: 'Reset your password',
+          text: `Please click this link to reset your password: ${resetLink}`,
+          html: `<p>Please click the link below to reset your password:</p><p><a href="${resetLink}">${resetLink}</a></p>`,
+        });
+      } catch (err) {
+        console.log(`[password-reset] MAIL_* not set — Reset link for ${user.email} (dev only): ${resetLink}`);
+      }
+
+      return reply.send({
+        ok: true,
+        message: 'Password reset link sent.',
+      });
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        return reply.status(400).send({
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid email format',
+        });
+      }
+      throw e;
+    }
+  });
+
+  app.post('/auth/reset-password', async (request, reply) => {
+    try {
+      const body = z
+        .object({
+          token: z.string().min(1),
+          password: z.string().min(8, 'Password must be at least 8 characters'),
+        })
+        .parse(request.body);
+
+      let payload: any;
+      try {
+        payload = app.jwt.verify(body.token) as any;
+      } catch (err) {
+        throw AppError.badRequest('Invalid or expired reset token');
+      }
+
+      if (payload.purpose !== 'password_reset' || !payload.userId) {
+        throw AppError.badRequest('Invalid reset token');
+      }
+
+      const [user] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, payload.userId))
+        .limit(1);
+
+      if (!user) {
+        throw AppError.notFound('User not found');
+      }
+
+      const passwordHash = await hashPassword(body.password);
+
+      await db.transaction(async (tx) => {
+        await tx.update(users).set({ passwordHash }).where(eq(users.id, user.id));
+        await tx.delete(refreshTokens).where(eq(refreshTokens.userId, user.id));
+      });
+
+      return reply.send({
+        ok: true,
+        message: 'Password reset successful.',
+      });
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        return reply.status(400).send({
+          code: 'VALIDATION_ERROR',
+          message: e.errors[0]?.message || 'Invalid input',
+        });
+      }
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
 }
