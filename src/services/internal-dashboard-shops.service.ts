@@ -6,6 +6,9 @@ import {
   shopUsers,
   shops,
   users,
+  products,
+  suppliers,
+  sales,
 } from '../db/schema/index.js';
 import { AppError } from '../lib/errors.js';
 
@@ -48,6 +51,7 @@ function mapListRow(r: {
   effectiveStatus: string;
   ownerEmail: string | null;
   ownerPhone: string | null;
+  maxUsers: number;
 }) {
   const trialEndsAt = r.trialEndsAt;
   const paidThrough = r.paidThrough;
@@ -68,6 +72,7 @@ function mapListRow(r: {
     isAccessAllowed: isAccessAllowed({ trialEndsAt, paidThrough, effectiveStatus: st }),
     ownerEmail: r.ownerEmail,
     ownerPhone: r.ownerPhone,
+    maxUsers: r.maxUsers,
   };
 }
 
@@ -132,6 +137,7 @@ export async function internalListShops(q: {
       effectiveStatus: sql<string>`${eff}`.as('effective_status'),
       ownerEmail: users.email,
       ownerPhone: users.phone,
+      maxUsers: shops.maxUsers,
     })
     .from(shops)
     .innerJoin(shopUsers, and(eq(shopUsers.shopId, shops.id), eq(shopUsers.role, 'owner')))
@@ -186,6 +192,7 @@ async function internalGetShopTx(shopId: string) {
       effectiveStatus: sql<string>`${eff}`.as('effective_status'),
       ownerEmail: users.email,
       ownerPhone: users.phone,
+      maxUsers: shops.maxUsers,
     })
     .from(shops)
     .innerJoin(shopUsers, and(eq(shopUsers.shopId, shops.id), eq(shopUsers.role, 'owner')))
@@ -238,6 +245,7 @@ async function internalGetShopTx(shopId: string) {
     isAccessAllowed: isAccessAllowed({ trialEndsAt, paidThrough, effectiveStatus: st }),
     ownerEmail: row.ownerEmail,
     ownerPhone: row.ownerPhone,
+    maxUsers: row.maxUsers,
   };
 
   return {
@@ -344,15 +352,16 @@ function resolveSubscriptionStatusAfterPatch(input: {
  */
 export async function internalUpdateShop(
   shopId: string,
-  patch: { suspended?: boolean; paidThrough?: Date | null; trialEndsAt?: Date; customerWebsiteEnabled?: boolean },
+  patch: { suspended?: boolean; paidThrough?: Date | null; trialEndsAt?: Date; customerWebsiteEnabled?: boolean; maxUsers?: number },
 ) {
   if (
     patch.suspended === undefined &&
     patch.paidThrough === undefined &&
     patch.trialEndsAt === undefined &&
-    patch.customerWebsiteEnabled === undefined
+    patch.customerWebsiteEnabled === undefined &&
+    patch.maxUsers === undefined
   ) {
-    throw AppError.badRequest('Provide suspended, paidThrough, trialEndsAt, or customerWebsiteEnabled');
+    throw AppError.badRequest('Provide suspended, paidThrough, trialEndsAt, customerWebsiteEnabled, or maxUsers');
   }
 
   await db.transaction(async (tx) => {
@@ -404,8 +413,97 @@ export async function internalUpdateShop(
       rowUpdate.settings = nextSettings;
     }
 
+    if (patch.maxUsers !== undefined) {
+      rowUpdate.maxUsers = patch.maxUsers;
+    }
+
     await tx.update(shops).set(rowUpdate).where(eq(shops.id, shopId));
   });
 
   return internalGetShop(shopId);
 }
+
+export async function internalGetShopUsers(shopId: string) {
+  return db
+    .select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+      phone: users.phone,
+      isActive: users.isActive,
+      role: shopUsers.role,
+      permissions: shopUsers.permissions,
+      createdAt: shopUsers.createdAt,
+    })
+    .from(shopUsers)
+    .innerJoin(users, eq(users.id, shopUsers.userId))
+    .where(eq(shopUsers.shopId, shopId))
+    .orderBy(asc(users.name));
+}
+
+export async function internalGetShopProducts(shopId: string, limit: number, offset: number, search?: string) {
+  const filters = [eq(products.shopId, shopId)];
+  if (search?.trim()) {
+    filters.push(ilike(products.name, `%${search.trim()}%`));
+  }
+  const where = and(...filters);
+
+  const items = await db
+    .select()
+    .from(products)
+    .where(where)
+    .limit(limit)
+    .offset(offset)
+    .orderBy(asc(products.name));
+
+  const [cnt] = await db
+    .select({ n: count() })
+    .from(products)
+    .where(where);
+
+  return {
+    items,
+    total: Number(cnt?.n ?? 0),
+  };
+}
+
+export async function internalGetShopSuppliers(shopId: string) {
+  return db
+    .select()
+    .from(suppliers)
+    .where(eq(suppliers.shopId, shopId))
+    .orderBy(asc(suppliers.name));
+}
+
+export async function internalGetShopSales(shopId: string, limit: number, offset: number) {
+  const where = eq(sales.shopId, shopId);
+  const items = await db
+    .select({
+      id: sales.id,
+      invoiceNo: sales.invoiceNo,
+      soldAt: sales.soldAt,
+      total: sales.total,
+      paidTotal: sales.paidTotal,
+      dueAmount: sales.dueAmount,
+      channel: sales.channel,
+      status: sales.status,
+      cashierName: users.name,
+    })
+    .from(sales)
+    .leftJoin(users, eq(users.id, sales.cashierUserId))
+    .where(where)
+    .limit(limit)
+    .offset(offset)
+    .orderBy(desc(sales.soldAt));
+
+  const [cnt] = await db
+    .select({ n: count() })
+    .from(sales)
+    .where(where);
+
+  return {
+    items,
+    total: Number(cnt?.n ?? 0),
+  };
+}
+

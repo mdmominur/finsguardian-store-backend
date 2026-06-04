@@ -122,7 +122,7 @@ export async function recordSupplierPayment(
   }
 
   const balanceNow = Number(await supplierBalanceAmount(supplierId));
-  if (amt > balanceNow + 0.009) {
+  if (amt > balanceNow + 0.10) {
     throw AppError.badRequest(
       `Payment cannot exceed amount owed to this supplier (৳${money2(balanceNow)} outstanding)`,
     );

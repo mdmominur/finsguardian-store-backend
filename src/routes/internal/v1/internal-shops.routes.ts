@@ -37,14 +37,16 @@ const patchShopBody = z
     /** Set trial end only (does not change paid_through). ISO 8601 instant. */
     trialEndsAt: z.string().optional(),
     customerWebsiteEnabled: z.boolean().optional(),
+    maxUsers: z.number().int().min(1).optional(),
   })
   .refine(
     (d) =>
       d.suspended !== undefined ||
       d.paidThrough !== undefined ||
       d.trialEndsAt !== undefined ||
-      d.customerWebsiteEnabled !== undefined,
-    { message: 'Provide at least one of suspended, paidThrough, trialEndsAt, customerWebsiteEnabled' },
+      d.customerWebsiteEnabled !== undefined ||
+      d.maxUsers !== undefined,
+    { message: 'Provide at least one of suspended, paidThrough, trialEndsAt, customerWebsiteEnabled, or maxUsers' },
   );
 
 export async function registerInternalShopRoutes(app: FastifyInstance) {
@@ -124,6 +126,7 @@ export async function registerInternalShopRoutes(app: FastifyInstance) {
         paidThrough,
         trialEndsAt,
         customerWebsiteEnabled: body.customerWebsiteEnabled,
+        maxUsers: body.maxUsers,
       });
       return reply.header('Content-Type', 'application/json; charset=utf-8').send(out);
     } catch (e) {
@@ -176,4 +179,75 @@ export async function registerInternalShopRoutes(app: FastifyInstance) {
       }
     },
   );
+
+  app.get<{ Params: { shopId: string } }>('/shops/:shopId/users', async (request, reply) => {
+    try {
+      const shopId = parseShopId(request.params.shopId);
+      const out = await internalShops.internalGetShopUsers(shopId);
+      return reply.header('Content-Type', 'application/json; charset=utf-8').send(out);
+    } catch (e) {
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
+
+  app.get<{ Params: { shopId: string } }>('/shops/:shopId/products', async (request, reply) => {
+    try {
+      const shopId = parseShopId(request.params.shopId);
+      const qs = z
+        .object({
+          limit: z.coerce.number().min(1).max(100).default(20),
+          offset: z.coerce.number().min(0).default(0),
+          q: z.string().optional(),
+        })
+        .parse(request.query);
+      const out = await internalShops.internalGetShopProducts(shopId, qs.limit, qs.offset, qs.q);
+      return reply.header('Content-Type', 'application/json; charset=utf-8').send(out);
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        return reply.status(400).send({
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid query',
+          details: e.flatten(),
+        });
+      }
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
+
+  app.get<{ Params: { shopId: string } }>('/shops/:shopId/suppliers', async (request, reply) => {
+    try {
+      const shopId = parseShopId(request.params.shopId);
+      const out = await internalShops.internalGetShopSuppliers(shopId);
+      return reply.header('Content-Type', 'application/json; charset=utf-8').send(out);
+    } catch (e) {
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
+
+  app.get<{ Params: { shopId: string } }>('/shops/:shopId/sales', async (request, reply) => {
+    try {
+      const shopId = parseShopId(request.params.shopId);
+      const qs = z
+        .object({
+          limit: z.coerce.number().min(1).max(100).default(20),
+          offset: z.coerce.number().min(0).default(0),
+        })
+        .parse(request.query);
+      const out = await internalShops.internalGetShopSales(shopId, qs.limit, qs.offset);
+      return reply.header('Content-Type', 'application/json; charset=utf-8').send(out);
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        return reply.status(400).send({
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid query',
+          details: e.flatten(),
+        });
+      }
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
 }

@@ -65,6 +65,8 @@ export async function registerPurchaseReturnRoutes(app: FastifyInstance) {
             refPoId: z.string().uuid().optional().nullable(),
             returnDate: z.string().optional().nullable(),
             note: z.string().optional().nullable(),
+            paymentMethodId: z.string().uuid(),
+            refundAmount: z.string(),
             lines: z.array(
               z.union([
                 z.object({
@@ -74,6 +76,7 @@ export async function registerPurchaseReturnRoutes(app: FastifyInstance) {
                   qty: z.string(),
                   unitCost: z.string().optional().nullable(),
                   poLineId: z.string().uuid().optional().nullable(),
+                  batchId: z.string().uuid().optional().nullable(),
                 }),
                 z.object({
                   productId: z.string().uuid(),

@@ -10,8 +10,12 @@ import {
   purchaseOrders,
   purchaseReturnLines,
   purchaseReturns,
+  shopPaymentMethods,
   supplierLedgerEntries,
   suppliers,
+  productBatches,
+  batchInventoryBalances,
+  batchInventoryMovements,
 } from '../db/schema/index.js';
 import { AppError } from '../lib/errors.js';
 import { isMultiStockLocationEnabled } from './shop-features.service.js';
@@ -212,6 +216,7 @@ export type CreatePurchaseReturnLine =
       qty: string;
       unitCost?: string | null;
       poLineId?: string | null;
+      batchId?: string | null;
     }
   | {
       productId: string;
@@ -229,6 +234,8 @@ export async function createPurchaseReturn(
     refPoId?: string | null;
     returnDate?: string | null;
     note?: string | null;
+    paymentMethodId?: string | null;
+    refundAmount?: string | null;
     lines: CreatePurchaseReturnLine[];
   },
 ) {
@@ -264,6 +271,23 @@ export async function createPurchaseReturn(
   const multi = await isMultiStockLocationEnabled(shopId);
 
   return db.transaction(async (tx) => {
+    if (!input.paymentMethodId) {
+      throw AppError.badRequest('Refund payment method is required');
+    }
+
+    const [pm] = await tx
+      .select()
+      .from(shopPaymentMethods)
+      .where(
+        and(
+          eq(shopPaymentMethods.id, input.paymentMethodId),
+          eq(shopPaymentMethods.shopId, shopId),
+          eq(shopPaymentMethods.isActive, true),
+        ),
+      )
+      .limit(1);
+    if (!pm) throw AppError.badRequest('Payment method not found or inactive');
+
     const [ret] = await tx
       .insert(purchaseReturns)
       .values({
@@ -272,6 +296,8 @@ export async function createPurchaseReturn(
         refPoId: input.refPoId ?? null,
         returnDate: input.returnDate ?? undefined,
         note: input.note ?? null,
+        paymentMethodId: input.paymentMethodId,
+        refundAmount: input.refundAmount ? money2(Number(input.refundAmount)) : '0.00',
         createdBy: userId,
       })
       .returning();
@@ -506,6 +532,77 @@ export async function createPurchaseReturn(
           }
         }
 
+        if (p.batchTrackingEnabled) {
+          if (!line.batchId) {
+            throw AppError.badRequest(`Batch selection is required for batch-tracked product: ${p.name}`);
+          }
+          const [batch] = await tx
+            .select()
+            .from(productBatches)
+            .where(
+              and(
+                eq(productBatches.id, line.batchId),
+                eq(productBatches.shopId, shopId),
+                eq(productBatches.productId, p.id),
+              ),
+            )
+            .limit(1);
+          if (!batch) {
+            throw AppError.notFound(`Selected batch not found for product: ${p.name}`);
+          }
+
+          const [batchBal] = await tx
+            .select()
+            .from(batchInventoryBalances)
+            .where(
+              and(
+                eq(batchInventoryBalances.shopId, shopId),
+                eq(batchInventoryBalances.batchId, batch.id),
+                eq(batchInventoryBalances.locationId, locationId),
+              ),
+            )
+            .limit(1);
+
+          const batchQty = Number(batchBal?.quantity ?? 0);
+          if (batchQty < qty - 1e-9) {
+            throw AppError.conflict(
+              `Insufficient quantity for batch "${batch.batchCode}" at the selected stock location (Available: ${batchQty}, Requested: ${qty})`
+            );
+          }
+
+          const updBatch = await tx
+            .update(batchInventoryBalances)
+            .set({
+              quantity: sql`${batchInventoryBalances.quantity}::numeric - ${String(qty)}::numeric`,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(batchInventoryBalances.shopId, shopId),
+                eq(batchInventoryBalances.batchId, batch.id),
+                eq(batchInventoryBalances.locationId, locationId),
+                sql`${batchInventoryBalances.quantity}::numeric >= ${String(qty)}::numeric`,
+              ),
+            )
+            .returning();
+
+          if (updBatch.length === 0) {
+            throw AppError.conflict(`Insufficient quantity for batch "${batch.batchCode}" at the selected stock location`);
+          }
+
+          await tx.insert(batchInventoryMovements).values({
+            shopId,
+            batchId: batch.id,
+            productId: p.id,
+            locationId,
+            quantityDelta: (-qty).toFixed(3),
+            movementType: 'PURCHASE_RETURN',
+            refTable: 'purchase_returns',
+            refId: ret.id,
+            createdBy: userId,
+          });
+        }
+
         await tx.insert(inventoryMovements).values({
           shopId,
           productId: p.id,
@@ -523,6 +620,7 @@ export async function createPurchaseReturn(
           productId: p.id,
           poLineId: line.poLineId ?? null,
           locationId,
+          batchId: line.batchId ?? null,
           qty: String(qty),
           unitCost: money2(unitCost),
           deviceUnitId: null,
@@ -544,6 +642,24 @@ export async function createPurchaseReturn(
       refId: input.refPoId ?? ret.id,
       note: input.refPoId ? 'Purchase return (linked PO)' : 'Purchase return',
     });
+
+    if (input.paymentMethodId) {
+      const refundAmt = Number(input.refundAmount);
+      if (!Number.isFinite(refundAmt) || refundAmt <= 0) {
+        throw AppError.badRequest('Refund amount must be positive');
+      }
+      if (refundAmt > creditTotal + 0.009) {
+        throw AppError.badRequest('Refund amount cannot exceed return credit total');
+      }
+      await tx.insert(supplierLedgerEntries).values({
+        supplierId: input.supplierId,
+        entryType: 'PAYMENT',
+        amount: money2(refundAmt),
+        refTable: 'purchase_returns',
+        refId: ret.id,
+        note: `Supplier refund for purchase return ${ret.id.slice(0, 8)}…`,
+      });
+    }
 
     return { id: ret.id, creditAmount: creditStr };
   });
@@ -570,10 +686,12 @@ export async function listPurchaseReturns(shopId: string, limit: number) {
       unitCost: purchaseReturnLines.unitCost,
       lineTotal: purchaseReturnLines.lineTotal,
       serial: deviceUnits.serial,
+      batchCode: productBatches.batchCode,
     })
     .from(purchaseReturnLines)
     .innerJoin(products, eq(products.id, purchaseReturnLines.productId))
     .leftJoin(deviceUnits, eq(deviceUnits.id, purchaseReturnLines.deviceUnitId))
+    .leftJoin(productBatches, eq(productBatches.id, purchaseReturnLines.batchId))
     .where(inArray(purchaseReturnLines.returnId, ids));
 
   const byRet: Record<string, typeof lines> = {};

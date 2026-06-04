@@ -62,6 +62,7 @@ export async function listPaymentMethodsWithBalances(shopId: string) {
           JOIN   sales s ON s.id = sp.sale_id
           WHERE  sp.payment_method_id = m.id
             AND  s.shop_id = ${shopId}
+            AND  s.status != 'VOID'
         ), 0)
         + COALESCE((
           SELECT SUM(adj.amount::numeric)
@@ -89,6 +90,18 @@ export async function listPaymentMethodsWithBalances(shopId: string) {
             AND  adj.shop_id = ${shopId}
             AND  adj.type = 'OUT'
         ), 0)
+        - COALESCE((
+          SELECT SUM(rf.payout_amount::numeric)
+          FROM   refunds rf
+          WHERE  rf.payment_method_id = m.id
+            AND  rf.shop_id = ${shopId}
+        ), 0)
+        + COALESCE((
+          SELECT SUM(pr.refund_amount::numeric)
+          FROM   purchase_returns pr
+          WHERE  pr.payment_method_id = m.id
+            AND  pr.shop_id = ${shopId}
+        ), 0)
       )::text AS balance
     FROM  shop_payment_methods m
     WHERE m.shop_id = ${shopId}
@@ -105,7 +118,7 @@ export async function getPaymentMethodBalance(shopId: string, methodId: string):
       COALESCE((
         SELECT SUM(sp.amount::numeric) FROM sale_payments sp
         JOIN sales s ON s.id = sp.sale_id
-        WHERE sp.payment_method_id = ${methodId} AND s.shop_id = ${shopId}
+        WHERE sp.payment_method_id = ${methodId} AND s.shop_id = ${shopId} AND s.status != 'VOID'
       ), 0)
       + COALESCE((
         SELECT SUM(adj.amount::numeric) FROM payment_method_adjustments adj
@@ -123,12 +136,20 @@ export async function getPaymentMethodBalance(shopId: string, methodId: string):
         SELECT SUM(adj.amount::numeric) FROM payment_method_adjustments adj
         WHERE adj.payment_method_id = ${methodId} AND adj.shop_id = ${shopId} AND adj.type = 'OUT'
       ), 0)
+      - COALESCE((
+        SELECT SUM(rf.payout_amount::numeric) FROM refunds rf
+        WHERE rf.payment_method_id = ${methodId} AND rf.shop_id = ${shopId}
+      ), 0)
+      + COALESCE((
+        SELECT SUM(pr.refund_amount::numeric) FROM purchase_returns pr
+        WHERE pr.payment_method_id = ${methodId} AND pr.shop_id = ${shopId}
+      ), 0)
     )::text AS balance
   `);
   return result.rows[0]?.balance ?? '0';
 }
 
-export type TxType = 'SALE' | 'EXPENSE' | 'SUPPLIER_PAYMENT' | 'CASH_IN' | 'WITHDRAWAL';
+export type TxType = 'SALE' | 'EXPENSE' | 'SUPPLIER_PAYMENT' | 'CASH_IN' | 'WITHDRAWAL' | 'REFUND' | 'PURCHASE_RETURN';
 
 export interface PaymentMethodTx {
   id: string;
@@ -140,7 +161,7 @@ export interface PaymentMethodTx {
   createdAt: Date;
 }
 
-/** All transactions for a payment method (UNION of 4 tables), paginated.
+/** All transactions for a payment method (UNION of 5 tables), paginated.
  *  Indexes on payment_method_id in each table keep this fast even at scale.
  */
 export async function listPaymentMethodTransactions(
@@ -174,7 +195,7 @@ export async function listPaymentMethodTransactions(
       JOIN  sales s ON s.id = sp.sale_id
       WHERE sp.payment_method_id = ${methodId}
         AND s.shop_id = ${shopId}
-        AND s.status = 'COMPLETED'
+        AND s.status != 'VOID'
 
       UNION ALL
 
@@ -221,6 +242,37 @@ export async function listPaymentMethodTransactions(
       FROM  payment_method_adjustments adj
       WHERE adj.payment_method_id = ${methodId}
         AND adj.shop_id = ${shopId}
+
+      UNION ALL
+
+      -- 5) Refunds paid out
+      SELECT
+        rf.id::text                AS id,
+        'REFUND'                   AS tx_type,
+        'OUT'                      AS direction,
+        rf.payout_amount           AS amount,
+        COALESCE(rf.note, 'Refund for invoice ' || s.invoice_no)::text AS description,
+        rf.id::text                AS ref_id,
+        rf.created_at              AS created_at
+      FROM  refunds rf
+      JOIN  sales s ON s.id = rf.sale_id
+      WHERE rf.payment_method_id = ${methodId}
+        AND rf.shop_id = ${shopId}
+
+      UNION ALL
+
+      -- 6) Purchase return cash refunds
+      SELECT
+        pr.id::text                AS id,
+        'PURCHASE_RETURN'          AS tx_type,
+        'IN'                       AS direction,
+        pr.refund_amount           AS amount,
+        COALESCE(pr.note, 'Refund for purchase return')::text AS description,
+        pr.id::text                AS ref_id,
+        pr.created_at              AS created_at
+      FROM  purchase_returns pr
+      WHERE pr.payment_method_id = ${methodId}
+        AND pr.shop_id = ${shopId}
     ) t
     ORDER BY created_at DESC
     LIMIT  ${fetchLimit}

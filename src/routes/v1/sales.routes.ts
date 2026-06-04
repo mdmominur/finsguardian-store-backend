@@ -232,6 +232,7 @@ export async function registerSaleRoutes(app: FastifyInstance) {
         const body = z
           .object({
             note: z.string().optional(),
+            paymentMethodId: z.string().uuid().optional().nullable(),
             lines: z.array(
               z.object({
                 saleLineId: z.string().uuid(),

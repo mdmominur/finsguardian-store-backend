@@ -347,6 +347,7 @@ export async function createRefund(
   input: {
     lines: { saleLineId: string; qty: string; amount: string; restock?: boolean }[];
     note?: string;
+    paymentMethodId?: string | null;
   },
 ) {
   if (input.lines.length === 0) throw AppError.badRequest('Refund lines required');
@@ -371,6 +372,44 @@ export async function createRefund(
       refundTotal += Number(l.amount);
     }
 
+    let reverseDue = 0;
+    if (sale.customerId && Number(sale.dueAmount) > 0) {
+      reverseDue = Math.min(Number(sale.dueAmount), refundTotal);
+    }
+    const payoutAmount = Math.max(0, refundTotal - reverseDue);
+
+    let paymentMethodId: string | null = null;
+    if (payoutAmount > 0) {
+      if (input.paymentMethodId) {
+        const [methodRow] = await tx
+          .select({ id: shopPaymentMethods.id })
+          .from(shopPaymentMethods)
+          .where(
+            and(
+              eq(shopPaymentMethods.id, input.paymentMethodId),
+              eq(shopPaymentMethods.shopId, shopId),
+              eq(shopPaymentMethods.isActive, true),
+            ),
+          )
+          .limit(1);
+        if (!methodRow) {
+          throw AppError.badRequest('Invalid or inactive payment method selected for refund');
+        }
+        paymentMethodId = input.paymentMethodId;
+      } else {
+        const payments = await tx
+          .select()
+          .from(salePayments)
+          .where(eq(salePayments.saleId, saleId));
+        if (payments.length > 0 && payments[0]?.paymentMethodId) {
+          paymentMethodId = payments[0].paymentMethodId;
+        } else {
+          const { getDefaultTenderPaymentMethodId } = await import('./shop-payment-method.service.js');
+          paymentMethodId = await getDefaultTenderPaymentMethodId(shopId);
+        }
+      }
+    }
+
     const [refund] = await tx
       .insert(refunds)
       .values({
@@ -379,6 +418,8 @@ export async function createRefund(
         totalAmount: refundTotal.toFixed(2),
         note: input.note ?? null,
         createdBy: userId,
+        paymentMethodId,
+        payoutAmount: payoutAmount.toFixed(2),
       })
       .returning();
 
@@ -573,18 +614,15 @@ export async function createRefund(
         );
     }
 
-    if (sale.customerId && Number(sale.dueAmount) > 0) {
-      const reverseDue = Math.min(Number(sale.dueAmount), refundTotal);
-      if (reverseDue > 0) {
-        await tx.insert(customerLedgerEntries).values({
-          customerId: sale.customerId,
-          entryType: 'ADJUSTMENT',
-          amount: (-reverseDue).toFixed(2),
-          refTable: 'refunds',
-          refId: refund.id,
-          note: 'Refund reduces customer due',
-        });
-      }
+    if (reverseDue > 0 && sale.customerId) {
+      await tx.insert(customerLedgerEntries).values({
+        customerId: sale.customerId,
+        entryType: 'ADJUSTMENT',
+        amount: (-reverseDue).toFixed(2),
+        refTable: 'refunds',
+        refId: refund.id,
+        note: 'Refund reduces customer due',
+      });
     }
 
     return refund;

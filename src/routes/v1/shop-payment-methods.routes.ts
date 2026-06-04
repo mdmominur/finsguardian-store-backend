@@ -10,7 +10,11 @@ export async function registerShopPaymentMethodRoutes(app: FastifyInstance) {
     '/shop-payment-methods',
     { preHandler: [app.authenticate] },
     async (request, reply) => {
-      if (!hasPermission(request.authUser, 'pos.use') && !hasPermission(request.authUser, 'finance.pricing')) {
+      if (
+        !hasPermission(request.authUser, 'pos.use') &&
+        !hasPermission(request.authUser, 'finance.pricing') &&
+        !hasPermission(request.authUser, 'sales.refund')
+      ) {
         return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
       }
       const withBalances = (request.query as Record<string, string>).withBalances === '1';

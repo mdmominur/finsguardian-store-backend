@@ -32,6 +32,7 @@ export const shops = pgTable(
     /** Last instant covered by manual subscription payments (excludes trial). */
     paidThrough: timestamp('paid_through', { withTimezone: true }),
     subscriptionStatus: text('subscription_status').notNull(),
+    maxUsers: integer('max_users').notNull().default(5),
   },
   (t) => [
     check(
@@ -690,6 +691,11 @@ export const purchaseReturns = pgTable(
       .notNull()
       .default(sql`(now() AT TIME ZONE 'UTC')::date`),
     note: text('note'),
+    paymentMethodId: uuid('payment_method_id')
+      .references(() => shopPaymentMethods.id, { onDelete: 'restrict' }),
+    refundAmount: numeric('refund_amount', { precision: 14, scale: 2 })
+      .notNull()
+      .default('0.00'),
     createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -697,6 +703,7 @@ export const purchaseReturns = pgTable(
   (t) => [
     index('ix_purchase_returns_shop_time').on(t.shopId, t.createdAt),
     index('ix_purchase_returns_supplier_time').on(t.supplierId, t.createdAt),
+    index('ix_purchase_returns_payment_method').on(t.paymentMethodId),
   ],
 );
 
@@ -716,6 +723,9 @@ export const purchaseReturnLines = pgTable(
     locationId: uuid('location_id').references(() => stockLocations.id, {
       onDelete: 'set null',
     }),
+    batchId: uuid('batch_id').references(() => productBatches.id, {
+      onDelete: 'set null',
+    }),
     qty: numeric('qty', { precision: 14, scale: 3 }).notNull(),
     unitCost: numeric('unit_cost', { precision: 14, scale: 2 }).notNull(),
     deviceUnitId: uuid('device_unit_id').references(() => deviceUnits.id, {
@@ -728,6 +738,7 @@ export const purchaseReturnLines = pgTable(
     check('purchase_return_lines_unit_cost_chk', sql`${t.unitCost} >= 0`),
     index('ix_purchase_return_lines_return').on(t.returnId),
     index('ix_purchase_return_lines_product').on(t.productId),
+    index('ix_purchase_return_lines_batch').on(t.batchId),
   ],
 );
 
@@ -1022,8 +1033,16 @@ export const refunds = pgTable(
     note: text('note'),
     createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    paymentMethodId: uuid('payment_method_id')
+      .references(() => shopPaymentMethods.id, { onDelete: 'restrict' }),
+    payoutAmount: numeric('payout_amount', { precision: 14, scale: 2 })
+      .notNull()
+      .default('0.00'),
   },
-  (t) => [index('ix_refunds_shop_time').on(t.shopId, t.createdAt)],
+  (t) => [
+    index('ix_refunds_shop_time').on(t.shopId, t.createdAt),
+    index('ix_refunds_payment_method').on(t.paymentMethodId).where(sql`payment_method_id IS NOT NULL`),
+  ],
 );
 
 export const refundLines = pgTable(

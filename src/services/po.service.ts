@@ -11,6 +11,9 @@ import {
   products,
   purchaseOrderLines,
   purchaseOrders,
+  purchaseReturnLines,
+  purchaseReturns,
+  shopPaymentMethods,
   stockLocations,
   supplierLedgerEntries,
   suppliers,
@@ -697,6 +700,47 @@ export async function getPurchaseOrder(shopId: string, poId: string) {
     }
   }
 
+  // Find any purchase returns for this PO
+  const returns = await db
+    .select({
+      id: purchaseReturns.id,
+      returnDate: purchaseReturns.returnDate,
+      note: purchaseReturns.note,
+      refundAmount: purchaseReturns.refundAmount,
+      paymentMethodId: purchaseReturns.paymentMethodId,
+      paymentMethodName: shopPaymentMethods.name,
+    })
+    .from(purchaseReturns)
+    .leftJoin(shopPaymentMethods, eq(shopPaymentMethods.id, purchaseReturns.paymentMethodId))
+    .where(
+      and(
+        eq(purchaseReturns.shopId, shopId),
+        eq(purchaseReturns.refPoId, poId),
+      ),
+    );
+
+  const returnIds = returns.map((r) => r.id);
+  const returnLines =
+    returnIds.length === 0
+      ? []
+      : await db
+          .select({
+            id: purchaseReturnLines.id,
+            returnId: purchaseReturnLines.returnId,
+            productId: purchaseReturnLines.productId,
+            poLineId: purchaseReturnLines.poLineId,
+            qty: purchaseReturnLines.qty,
+            unitCost: purchaseReturnLines.unitCost,
+            lineTotal: purchaseReturnLines.lineTotal,
+            productName: products.name,
+            productSku: products.sku,
+            serial: deviceUnits.serial,
+          })
+          .from(purchaseReturnLines)
+          .innerJoin(products, eq(products.id, purchaseReturnLines.productId))
+          .leftJoin(deviceUnits, eq(deviceUnits.id, purchaseReturnLines.deviceUnitId))
+          .where(inArray(purchaseReturnLines.returnId, returnIds));
+
   return {
     po,
     lines,
@@ -705,6 +749,8 @@ export async function getPurchaseOrder(shopId: string, poId: string) {
     receiveQtyMovementsByLineId,
     receiveSerialsByLocationByLineId,
     settlement: (await settlementByPoIds([poId])).get(poId)!,
+    returns,
+    returnLines,
   };
 }
 
@@ -763,3 +809,83 @@ export async function updatePoStatus(
 
   return row!;
 }
+
+export async function updatePurchaseOrder(
+  shopId: string,
+  poId: string,
+  input: {
+    supplierId?: string;
+    orderDate?: string;
+    expectedDate?: string | null;
+    note?: string | null;
+    lines?: { productId: string; qtyOrdered: string; unitCost: string }[];
+  },
+) {
+  const [po] = await db
+    .select()
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.shopId, shopId)))
+    .limit(1);
+
+  if (!po) throw AppError.notFound('PO not found');
+  if (po.status !== 'DRAFT') {
+    throw AppError.conflict('Only DRAFT purchase orders can be edited');
+  }
+
+  return db.transaction(async (tx) => {
+    const updateObj: any = { updatedAt: new Date() };
+    if (input.supplierId !== undefined) {
+      const [sup] = await tx
+        .select()
+        .from(suppliers)
+        .where(and(eq(suppliers.id, input.supplierId), eq(suppliers.shopId, shopId)))
+        .limit(1);
+      if (!sup) throw AppError.notFound('Supplier not found');
+      updateObj.supplierId = input.supplierId;
+    }
+    if (input.orderDate !== undefined) updateObj.orderDate = input.orderDate;
+    if (input.expectedDate !== undefined) updateObj.expectedDate = input.expectedDate;
+    if (input.note !== undefined) updateObj.note = input.note;
+
+    await tx.update(purchaseOrders).set(updateObj).where(eq(purchaseOrders.id, poId));
+
+    if (input.lines !== undefined) {
+      if (input.lines.length === 0) throw AppError.badRequest('PO needs lines');
+
+      // Delete existing lines
+      await tx.delete(purchaseOrderLines).where(eq(purchaseOrderLines.poId, poId));
+
+      for (const line of input.lines) {
+        const [p] = await tx
+          .select()
+          .from(products)
+          .where(and(eq(products.id, line.productId), eq(products.shopId, shopId)))
+          .limit(1);
+
+        if (!p) throw AppError.notFound(`Product ${line.productId}`);
+
+        const lineTotal = (
+          Number(line.qtyOrdered) * Number(line.unitCost)
+        ).toFixed(2);
+
+        await tx.insert(purchaseOrderLines).values({
+          poId,
+          productId: p.id,
+          qtyOrdered: line.qtyOrdered,
+          qtyReceived: '0',
+          unitCost: line.unitCost,
+          lineTotal,
+        });
+      }
+    }
+
+    const [updated] = await tx
+      .select()
+      .from(purchaseOrders)
+      .where(eq(purchaseOrders.id, poId))
+      .limit(1);
+
+    return updated!;
+  });
+}
+

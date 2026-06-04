@@ -102,6 +102,47 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
     },
   );
 
+  app.patch(
+    '/purchase-orders/:id',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!hasPermission(request.authUser, 'purchase_orders.manage')) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const body = z
+          .object({
+            supplierId: z.string().uuid().optional(),
+            orderDate: z.string().optional(),
+            expectedDate: z.string().nullable().optional(),
+            note: z.string().nullable().optional(),
+            lines: z
+              .array(
+                z.object({
+                  productId: z.string().uuid(),
+                  qtyOrdered: z.string(),
+                  unitCost: z.string(),
+                }),
+              )
+              .optional(),
+          })
+          .parse(request.body);
+
+        const po = await poService.updatePurchaseOrder(
+          request.authUser.shopId,
+          id,
+          body,
+        );
+        return reply.send(po);
+      } catch (e) {
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+
   app.post(
     '/purchase-orders/:id/receive',
     { preHandler: [app.authenticate] },
