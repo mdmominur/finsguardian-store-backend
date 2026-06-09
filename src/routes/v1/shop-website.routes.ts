@@ -20,6 +20,7 @@ const patchWebsiteBody = z
     enabled: z.boolean().optional(),
     publishedAt: z.string().nullable().optional(),
     logoUrl: z.string().nullable().optional(),
+    domain: z.string().nullable().optional(),
     policies: z
       .object({
         privacy: z.string().nullable().optional(),

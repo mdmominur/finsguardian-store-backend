@@ -52,6 +52,7 @@ export type ShopWebsiteSettings = {
   enabled: boolean;
   publishedAt: string | null;
   logoUrl: string | null;
+  domain: string | null;
   policies: {
     privacy: string | null;
     terms: string | null;
@@ -131,6 +132,10 @@ export function readWebsiteSettings(settings: unknown): ShopWebsiteSettings {
     ? s.websiteLogoUrl.trim()
     : null;
 
+  const domain = typeof s.websiteDomain === 'string' && s.websiteDomain.trim()
+    ? s.websiteDomain.trim()
+    : null;
+
   const publishedAt =
     typeof s.customerWebsitePublishedAt === 'string' && s.customerWebsitePublishedAt.trim()
       ? s.customerWebsitePublishedAt.trim()
@@ -207,6 +212,7 @@ export function readWebsiteSettings(settings: unknown): ShopWebsiteSettings {
     enabled,
     publishedAt,
     logoUrl,
+    domain,
     policies: {
       privacy: typeof policiesRaw.privacy === 'string' ? (policiesRaw.privacy as string) : null,
       terms: typeof policiesRaw.terms === 'string' ? (policiesRaw.terms as string) : null,
@@ -243,6 +249,7 @@ export async function patchShopWebsiteSettings(
     /** ISO 8601; set when shop “goes live” for analytics/support. */
     publishedAt: string | null;
     logoUrl: string | null;
+    domain: string | null;
     policies: Partial<ShopWebsiteSettings['policies']>;
     theme: Partial<ShopWebsiteSettings['theme']>;
     contact: Partial<ShopWebsiteSettings['contact']>;
@@ -273,6 +280,12 @@ export async function patchShopWebsiteSettings(
     const v = patch.logoUrl?.trim() ?? '';
     if (v) next.websiteLogoUrl = v;
     else delete next.websiteLogoUrl;
+  }
+
+  if (patch.domain !== undefined) {
+    const v = patch.domain?.trim() ?? '';
+    if (v) next.websiteDomain = v;
+    else delete next.websiteDomain;
   }
 
   if (patch.policies !== undefined) {

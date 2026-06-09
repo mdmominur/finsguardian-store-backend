@@ -10,6 +10,8 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
+    "db:baseline": "tsx brain_baseline_migrations.ts",
+    "db:migrate": "tsx migrate.ts",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit"
   },

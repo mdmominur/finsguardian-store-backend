@@ -195,7 +195,7 @@ export const products = pgTable(
     costMethod: text('cost_method').notNull().default('MOVING_AVG'),
     unitCost: numeric('unit_cost', { precision: 14, scale: 2 }).notNull().default('0'),
     listPrice: numeric('list_price', { precision: 14, scale: 2 }).notNull().default('0'),
-    minStockLevel: integer('min_stock_level').notNull().default(0),
+    minStockLevel: numeric('min_stock_level', { precision: 14, scale: 3 }).notNull().default('0'),
     /** QUANTITY: when false, POS skips stock warnings and checkout skips balance deduction. */
     inventoryTracked: boolean('inventory_tracked').notNull().default(true),
     /**

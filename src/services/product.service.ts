@@ -11,6 +11,7 @@ import {
   deviceUnits,
   productBatches,
   products,
+  productWebsiteProfiles,
   purchaseOrderLines,
   purchaseOrders,
   stockLocations,
@@ -292,7 +293,7 @@ export async function listProducts(
         quantityOnHand = String(c?.n ?? 0);
       }
 
-      const min = p.minStockLevel;
+      const min = Number(p.minStockLevel || 0);
       const qNum = Number(quantityOnHand);
       let stockBadge: 'EMPTY' | 'LOW' | 'GOOD' = 'GOOD';
       if (qNum <= 0) stockBadge = 'EMPTY';
@@ -484,7 +485,7 @@ export async function createProduct(
         costMethod: input.costMethod ?? 'MOVING_AVG',
         unitCost: input.unitCost ?? '0',
         listPrice: input.listPrice ?? '0',
-        minStockLevel: input.minStockLevel ?? 0,
+        minStockLevel: String(input.minStockLevel ?? 0),
         inventoryTracked,
         batchTrackingEnabled,
         batchDatesRequired,
@@ -495,6 +496,22 @@ export async function createProduct(
       .returning();
 
     if (!row) throw AppError.conflict('Could not create product');
+
+    if (input.website) {
+      await tx
+        .insert(productWebsiteProfiles)
+        .values({
+          shopId,
+          productId: row.id,
+          visible: input.website.visible ?? false,
+          seoSlug: input.website.slug || null,
+          shortDescription: input.website.shortDescription || null,
+          longDescription: input.website.longDescription || null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .onConflictDoNothing();
+    }
 
     if (input.trackingMode === 'SERIALIZED' && openingSerials.length > 0) {
       for (const serial of openingSerials) {
@@ -703,12 +720,40 @@ export async function updateProduct(
     currentMeta.website = currentWebsite;
     nextPatch.metadata = currentMeta;
     delete (nextPatch as any).website;
+
+    await db
+      .insert(productWebsiteProfiles)
+      .values({
+        shopId,
+        productId,
+        visible: patch.website.visible ?? false,
+        seoSlug: patch.website.slug || null,
+        shortDescription: patch.website.shortDescription || null,
+        longDescription: patch.website.longDescription || null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [productWebsiteProfiles.shopId, productWebsiteProfiles.productId],
+        set: {
+          ...(patch.website.visible !== undefined ? { visible: patch.website.visible } : {}),
+          ...(patch.website.slug !== undefined ? { seoSlug: patch.website.slug || null } : {}),
+          ...(patch.website.shortDescription !== undefined ? { shortDescription: patch.website.shortDescription || null } : {}),
+          ...(patch.website.longDescription !== undefined ? { longDescription: patch.website.longDescription || null } : {}),
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  const setValues: any = { ...nextPatch };
+  if (patch.minStockLevel !== undefined) {
+    setValues.minStockLevel = String(patch.minStockLevel);
   }
 
   const [row] = await db
     .update(products)
     .set({
-      ...nextPatch,
+      ...setValues,
       updatedAt: new Date(),
     })
     .where(and(eq(products.id, productId), eq(products.shopId, shopId)))

@@ -41,6 +41,15 @@ function shopAddressFromSettings(settings: unknown): string | null {
   return null;
 }
 
+function websiteInfoFromSettings(settings: unknown) {
+  if (!settings || typeof settings !== 'object') return { enabled: false, logoUrl: null, domain: null };
+  const o = settings as Record<string, unknown>;
+  const enabled = o.customerWebsiteEnabled === true;
+  const logoUrl = typeof o.websiteLogoUrl === 'string' && o.websiteLogoUrl.trim() ? o.websiteLogoUrl.trim() : null;
+  const domain = typeof o.websiteDomain === 'string' && o.websiteDomain.trim() ? o.websiteDomain.trim() : null;
+  return { enabled, logoUrl, domain };
+}
+
 async function quantityDeductedLocationNamesForSale(
   shopId: string,
   saleId: string,
@@ -249,6 +258,7 @@ export async function getSaleDetail(shopId: string, saleId: string) {
     customer,
     shopName: shop?.name ?? 'Store',
     shopAddress: shopAddressFromSettings(shop?.settings),
+    websiteInfo: websiteInfoFromSettings(shop?.settings),
     quantityDeductedFromLocations,
   };
 }
@@ -336,6 +346,7 @@ export async function getSaleDetailPublic(saleId: string) {
     customer,
     shopName: shop?.name ?? 'Store',
     shopAddress: shopAddressFromSettings(shop?.settings),
+    websiteInfo: websiteInfoFromSettings(shop?.settings),
     quantityDeductedFromLocations,
   };
 }
