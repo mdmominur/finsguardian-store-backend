@@ -396,7 +396,7 @@ export async function createProduct(
     createdByUserId?: string | null;
   },
 ) {
-  const openingQty = Math.max(0, Math.floor(Number(input.openingQty ?? 0) || 0));
+  const openingQty = Math.max(0, Number(input.openingQty ?? 0) || 0);
   const openingSerials = (input.openingSerials ?? [])
     .map((s) => s.trim())
     .filter(Boolean);

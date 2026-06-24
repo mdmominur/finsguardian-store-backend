@@ -126,9 +126,9 @@ export async function placeStorefrontFulfillmentOrder(input: {
 
   const mergedQty = new Map<string, number>();
   for (const raw of input.lines) {
-    const q = Math.floor(Number(raw.qty));
-    if (!Number.isFinite(q) || q < 1) {
-      throw AppError.badRequest('Each line needs a positive whole-number quantity');
+    const q = Number(raw.qty);
+    if (!Number.isFinite(q) || q <= 0) {
+      throw AppError.badRequest('Each line needs a positive quantity');
     }
     mergedQty.set(raw.productId, (mergedQty.get(raw.productId) ?? 0) + q);
   }
@@ -436,7 +436,7 @@ export async function createPosHoldFromFulfillmentOrder(input: {
     const label = [p.name, p.sku].filter(Boolean).join(' • ') || p.name;
     const unitPrice = Number(ln.unitPrice);
     const qtyN = Number(ln.qty);
-    if (!Number.isFinite(unitPrice) || !Number.isFinite(qtyN) || qtyN < 1) continue;
+    if (!Number.isFinite(unitPrice) || !Number.isFinite(qtyN) || qtyN <= 0) continue;
 
     if (p.trackingMode === 'SERIALIZED') {
       for (let i = 0; i < Math.floor(qtyN); i++) {
@@ -452,7 +452,7 @@ export async function createPosHoldFromFulfillmentOrder(input: {
         kind: 'bulk',
         productId: p.id,
         productLabel: label,
-        qty: Math.floor(qtyN),
+        qty: qtyN,
         unitPrice,
         discount: 0,
         uomId: null,

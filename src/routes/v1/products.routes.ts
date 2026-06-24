@@ -341,7 +341,7 @@ export async function registerProductRoutes(app: FastifyInstance) {
               .optional(),
             autoBarcode: z.boolean().optional(),
             inventoryTracked: z.boolean().optional(),
-            openingQty: z.number().int().min(0).optional(),
+            openingQty: z.number().min(0).optional(),
             openingSerials: z.array(z.string().min(1)).optional(),
             openingBatches: z
               .array(

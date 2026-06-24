@@ -43,7 +43,7 @@ const placeWebOrderBody = z.object({
   lines: z.array(
     z.object({
       productId: z.string().uuid(),
-      qty: z.coerce.number().int().positive(),
+      qty: z.coerce.number().positive(),
     }),
   ),
 });
