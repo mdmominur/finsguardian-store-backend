@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gte, ilike, lte, or, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   batchInventoryBalances,
@@ -114,40 +114,42 @@ export async function listSales(
 
   const whereClause = and(...conditions);
 
-  const [countRow] = await db
-    .select({ total: count() })
-    .from(sales)
-    .leftJoin(customers, eq(sales.customerId, customers.id))
-    .where(whereClause);
+  const [[countRow], rows] = await Promise.all([
+    db
+      .select({ total: count() })
+      .from(sales)
+      .leftJoin(customers, eq(sales.customerId, customers.id))
+      .where(whereClause),
 
-  const rows = await db
-    .select({
-      id: sales.id,
-      shopId: sales.shopId,
-      invoiceNo: sales.invoiceNo,
-      customerId: sales.customerId,
-      soldAt: sales.soldAt,
-      subtotal: sales.subtotal,
-      discountTotal: sales.discountTotal,
-      taxTotal: sales.taxTotal,
-      total: sales.total,
-      paidTotal: sales.paidTotal,
-      dueAmount: sales.dueAmount,
-      promisePayDate: sales.promisePayDate,
-      status: sales.status,
-      channel: sales.channel,
-      cashierUserId: sales.cashierUserId,
-      idempotencyKey: sales.idempotencyKey,
-      createdAt: sales.createdAt,
-      customerName: customers.name,
-      customerPhone: customers.phone,
-    })
-    .from(sales)
-    .leftJoin(customers, eq(sales.customerId, customers.id))
-    .where(whereClause)
-    .orderBy(desc(sales.soldAt))
-    .limit(opts.limit)
-    .offset(opts.offset);
+    db
+      .select({
+        id: sales.id,
+        shopId: sales.shopId,
+        invoiceNo: sales.invoiceNo,
+        customerId: sales.customerId,
+        soldAt: sales.soldAt,
+        subtotal: sales.subtotal,
+        discountTotal: sales.discountTotal,
+        taxTotal: sales.taxTotal,
+        total: sales.total,
+        paidTotal: sales.paidTotal,
+        dueAmount: sales.dueAmount,
+        promisePayDate: sales.promisePayDate,
+        status: sales.status,
+        channel: sales.channel,
+        cashierUserId: sales.cashierUserId,
+        idempotencyKey: sales.idempotencyKey,
+        createdAt: sales.createdAt,
+        customerName: customers.name,
+        customerPhone: customers.phone,
+      })
+      .from(sales)
+      .leftJoin(customers, eq(sales.customerId, customers.id))
+      .where(whereClause)
+      .orderBy(desc(sales.soldAt))
+      .limit(opts.limit)
+      .offset(opts.offset),
+  ]);
 
   return { items: rows, total: Number(countRow?.total ?? 0) };
 }
@@ -161,39 +163,100 @@ export async function getSaleDetail(shopId: string, saleId: string) {
 
   if (!sale) return null;
 
-  const lines = await db
-    .select({
-      id: saleLines.id,
-      saleId: saleLines.saleId,
-      productId: saleLines.productId,
-      description: saleLines.description,
-      qty: saleLines.qty,
-      unitPrice: saleLines.unitPrice,
-      discount: saleLines.discount,
-      lineTotal: saleLines.lineTotal,
-      cogsUnitCost: saleLines.cogsUnitCost,
-      deviceUnitId: saleLines.deviceUnitId,
-      productName: products.name,
-      productSku: products.sku,
-      uomId: products.uomId,
-      uomName: uoms.name,
-      uomSymbol: uoms.symbol,
-      uomIsActive: uoms.isActive,
-    })
-    .from(saleLines)
-    .innerJoin(products, eq(products.id, saleLines.productId))
-    .leftJoin(uoms, eq(uoms.id, products.uomId))
-    .where(eq(saleLines.saleId, saleId));
+  const [
+    lines,
+    refundedByLineRows,
+    payments,
+    customerRows,
+    shopRows,
+    quantityDeductedFromLocations,
+    refundRows,
+  ] = await Promise.all([
+    db
+      .select({
+        id: saleLines.id,
+        saleId: saleLines.saleId,
+        productId: saleLines.productId,
+        description: saleLines.description,
+        qty: saleLines.qty,
+        unitPrice: saleLines.unitPrice,
+        discount: saleLines.discount,
+        lineTotal: saleLines.lineTotal,
+        cogsUnitCost: saleLines.cogsUnitCost,
+        deviceUnitId: saleLines.deviceUnitId,
+        productName: products.name,
+        productSku: products.sku,
+        uomId: products.uomId,
+        uomName: uoms.name,
+        uomSymbol: uoms.symbol,
+        uomIsActive: uoms.isActive,
+      })
+      .from(saleLines)
+      .innerJoin(products, eq(products.id, saleLines.productId))
+      .leftJoin(uoms, eq(uoms.id, products.uomId))
+      .where(eq(saleLines.saleId, saleId)),
 
-  const refundedByLineRows = await db
-    .select({
-      saleLineId: refundLines.saleLineId,
-      refundedQty: sql<string>`coalesce(sum(${refundLines.qty}::numeric), 0)::text`,
-    })
-    .from(refundLines)
-    .innerJoin(refunds, eq(refunds.id, refundLines.refundId))
-    .where(and(eq(refunds.shopId, shopId), eq(refunds.saleId, saleId)))
-    .groupBy(refundLines.saleLineId);
+    db
+      .select({
+        saleLineId: refundLines.saleLineId,
+        refundedQty: sql<string>`coalesce(sum(${refundLines.qty}::numeric), 0)::text`,
+      })
+      .from(refundLines)
+      .innerJoin(refunds, eq(refunds.id, refundLines.refundId))
+      .where(and(eq(refunds.shopId, shopId), eq(refunds.saleId, saleId)))
+      .groupBy(refundLines.saleLineId),
+
+    db
+      .select({
+        id: salePayments.id,
+        saleId: salePayments.saleId,
+        paymentMethodId: salePayments.paymentMethodId,
+        method: sql<string>`coalesce(${salePayments.methodLabelSnapshot}, ${shopPaymentMethods.name})`,
+        amount: salePayments.amount,
+        providerReference: salePayments.providerReference,
+        createdAt: salePayments.createdAt,
+      })
+      .from(salePayments)
+      .leftJoin(shopPaymentMethods, eq(shopPaymentMethods.id, salePayments.paymentMethodId))
+      .where(eq(salePayments.saleId, saleId)),
+
+    sale.customerId
+      ? db
+          .select({
+            id: customers.id,
+            name: customers.name,
+            phone: customers.phone,
+            email: customers.email,
+            address: customers.address,
+          })
+          .from(customers)
+          .where(eq(customers.id, sale.customerId))
+          .limit(1)
+      : Promise.resolve([]),
+
+    db
+      .select({ name: shops.name, settings: shops.settings })
+      .from(shops)
+      .where(eq(shops.id, shopId))
+      .limit(1),
+
+    quantityDeductedLocationNamesForSale(shopId, saleId),
+
+    db
+      .select({
+        id: refunds.id,
+        totalAmount: refunds.totalAmount,
+        payoutAmount: refunds.payoutAmount,
+        note: refunds.note,
+        createdAt: refunds.createdAt,
+        paymentMethodId: refunds.paymentMethodId,
+        paymentMethodName: shopPaymentMethods.name,
+      })
+      .from(refunds)
+      .leftJoin(shopPaymentMethods, eq(shopPaymentMethods.id, refunds.paymentMethodId))
+      .where(and(eq(refunds.shopId, shopId), eq(refunds.saleId, saleId)))
+      .orderBy(desc(refunds.createdAt)),
+  ]);
 
   const refundedByLine = new Map<string, string>();
   for (const r of refundedByLineRows) refundedByLine.set(r.saleLineId, r.refundedQty);
@@ -204,52 +267,33 @@ export async function getSaleDetail(shopId: string, saleId: string) {
     return { ...l, refundedQty, remainingQty };
   });
 
-  const payments = await db
-    .select({
-      id: salePayments.id,
-      saleId: salePayments.saleId,
-      paymentMethodId: salePayments.paymentMethodId,
-      method: sql<string>`coalesce(${salePayments.methodLabelSnapshot}, ${shopPaymentMethods.name})`,
-      amount: salePayments.amount,
-      providerReference: salePayments.providerReference,
-      createdAt: salePayments.createdAt,
-    })
-    .from(salePayments)
-    .leftJoin(shopPaymentMethods, eq(shopPaymentMethods.id, salePayments.paymentMethodId))
-    .where(eq(salePayments.saleId, saleId));
+  const customer = customerRows[0] ?? null;
+  const shop = shopRows[0];
 
-  let customer: {
-    id: string;
-    name: string;
-    phone: string;
-    email: string | null;
-    address: string | null;
-  } | null = null;
-  if (sale.customerId) {
-    const [c] = await db
-      .select({
-        id: customers.id,
-        name: customers.name,
-        phone: customers.phone,
-        email: customers.email,
-        address: customers.address,
-      })
-      .from(customers)
-      .where(eq(customers.id, sale.customerId))
-      .limit(1);
-    customer = c ?? null;
-  }
+  const refundIds = refundRows.map((r) => r.id);
+  const refundLineRows =
+    refundIds.length === 0
+      ? []
+      : await db
+          .select({
+            id: refundLines.id,
+            refundId: refundLines.refundId,
+            saleLineId: refundLines.saleLineId,
+            qty: refundLines.qty,
+            amount: refundLines.amount,
+            restock: refundLines.restock,
+            productName: products.name,
+            productSku: products.sku,
+            description: saleLines.description,
+          })
+          .from(refundLines)
+          .innerJoin(saleLines, eq(saleLines.id, refundLines.saleLineId))
+          .innerJoin(products, eq(products.id, saleLines.productId))
+          .where(inArray(refundLines.refundId, refundIds));
 
-  const [shop] = await db
-    .select({ name: shops.name, settings: shops.settings })
-    .from(shops)
-    .where(eq(shops.id, shopId))
-    .limit(1);
-
-  const quantityDeductedFromLocations = await quantityDeductedLocationNamesForSale(
-    shopId,
-    saleId,
-  );
+  const totalRefundedAmount = refundRows
+    .reduce((sum, r) => sum + Number(r.totalAmount), 0)
+    .toFixed(2);
 
   return {
     sale,
@@ -260,6 +304,9 @@ export async function getSaleDetail(shopId: string, saleId: string) {
     shopAddress: shopAddressFromSettings(shop?.settings),
     websiteInfo: websiteInfoFromSettings(shop?.settings),
     quantityDeductedFromLocations,
+    refunds: refundRows,
+    refundLines: refundLineRows,
+    totalRefundedAmount,
   };
 }
 
@@ -377,11 +424,74 @@ export async function createRefund(
       throw AppError.conflict('Sale not refundable in current status');
     }
 
+    // Validate lines and recompute amounts server-side (ignore client amount).
+    const computedLines: Array<{
+      saleLine: typeof saleLines.$inferSelect;
+      wantQty: number;
+      amount: string;
+      restock: boolean;
+    }> = [];
     let refundTotal = 0;
+    const seenLineIds = new Set<string>();
 
     for (const l of input.lines) {
-      refundTotal += Number(l.amount);
+      if (seenLineIds.has(l.saleLineId)) {
+        throw AppError.badRequest('Duplicate sale line in refund');
+      }
+      seenLineIds.add(l.saleLineId);
+
+      const [sl] = await tx
+        .select()
+        .from(saleLines)
+        .where(and(eq(saleLines.id, l.saleLineId), eq(saleLines.saleId, saleId)))
+        .limit(1);
+
+      if (!sl) throw AppError.notFound('Sale line not found');
+
+      const maxQty = Number(sl.qty);
+      const wantQty = Number(l.qty);
+      if (!Number.isFinite(wantQty) || wantQty <= 0) {
+        throw AppError.badRequest('Refund qty must be a positive number');
+      }
+      if (wantQty > maxQty + 1e-9) throw AppError.badRequest('Refund qty exceeds sold qty');
+
+      const [already] = await tx
+        .select({
+          sumQty: sql<string>`coalesce(sum(${refundLines.qty}::numeric), 0)::text`,
+        })
+        .from(refundLines)
+        .innerJoin(refunds, eq(refunds.id, refundLines.refundId))
+        .where(
+          and(
+            eq(refunds.shopId, shopId),
+            eq(refunds.saleId, saleId),
+            eq(refundLines.saleLineId, sl.id),
+          ),
+        );
+      const alreadyQty = Number(already?.sumQty ?? 0);
+      const remaining = maxQty - alreadyQty;
+      if (wantQty > remaining + 1e-9) {
+        throw AppError.conflict('Refund qty exceeds remaining refundable qty', {
+          soldQty: maxQty,
+          alreadyRefundedQty: alreadyQty,
+          remainingRefundableQty: Math.max(0, remaining),
+          requestedQty: wantQty,
+        });
+      }
+
+      const frac = maxQty > 0 ? wantQty / maxQty : 0;
+      const amountNum = Number(sl.lineTotal) * frac;
+      const amount = amountNum.toFixed(2);
+      refundTotal += Number(amount);
+      computedLines.push({
+        saleLine: sl,
+        wantQty,
+        amount,
+        restock: l.restock !== false,
+      });
     }
+
+    if (computedLines.length === 0) throw AppError.badRequest('Refund lines required');
 
     let reverseDue = 0;
     if (sale.customerId && Number(sale.dueAmount) > 0) {
@@ -436,57 +546,16 @@ export async function createRefund(
 
     if (!refund) throw AppError.conflict('Refund failed');
 
-    for (const l of input.lines) {
-      const [sl] = await tx
-        .select()
-        .from(saleLines)
-        .where(
-          and(eq(saleLines.id, l.saleLineId), eq(saleLines.saleId, saleId)),
-        )
-        .limit(1);
-
-      if (!sl) throw AppError.notFound('Sale line not found');
-
-      const maxQty = Number(sl.qty);
-      const wantQty = Number(l.qty);
-      if (!Number.isFinite(wantQty) || wantQty <= 0) {
-        throw AppError.badRequest('Refund qty must be a positive number');
-      }
-      if (wantQty > maxQty + 1e-9) throw AppError.badRequest('Refund qty exceeds sold qty');
-
-      const [already] = await tx
-        .select({
-          sumQty: sql<string>`coalesce(sum(${refundLines.qty}::numeric), 0)::text`,
-        })
-        .from(refundLines)
-        .innerJoin(refunds, eq(refunds.id, refundLines.refundId))
-        .where(
-          and(
-            eq(refunds.shopId, shopId),
-            eq(refunds.saleId, saleId),
-            eq(refundLines.saleLineId, sl.id),
-          ),
-        );
-      const alreadyQty = Number(already?.sumQty ?? 0);
-      const remaining = maxQty - alreadyQty;
-      if (wantQty > remaining + 1e-9) {
-        throw AppError.conflict('Refund qty exceeds remaining refundable qty', {
-          soldQty: maxQty,
-          alreadyRefundedQty: alreadyQty,
-          remainingRefundableQty: Math.max(0, remaining),
-          requestedQty: wantQty,
-        });
-      }
-
+    for (const { saleLine: sl, wantQty, amount, restock } of computedLines) {
       await tx.insert(refundLines).values({
         refundId: refund.id,
         saleLineId: sl.id,
         qty: String(wantQty),
-        amount: l.amount,
-        restock: l.restock ?? true,
+        amount,
+        restock,
       });
 
-      if (l.restock !== false) {
+      if (restock) {
         if (sl.deviceUnitId) {
           await tx
             .update(deviceUnits)
@@ -597,20 +666,42 @@ export async function createRefund(
       }
     }
 
-    const [totalRefunded] = await tx
-      .select({
-        sumAmount: sql<string>`coalesce(sum(${refunds.totalAmount}::numeric), 0)::text`,
-      })
-      .from(refunds)
-      .where(and(eq(refunds.shopId, shopId), eq(refunds.saleId, saleId)));
+    // Status from remaining returnable qty (not refund amount vs sale.total).
+    // Amount comparison can mark a partial return as REFUNDED and drop the
+    // whole invoice from older dashboard filters.
+    const remRes = await tx.execute(sql`
+      select coalesce(sum(
+        greatest(
+          sl.qty::numeric - coalesce((
+            select sum(rl.qty::numeric)
+            from refund_lines rl
+            inner join refunds r on r.id = rl.refund_id
+            where rl.sale_line_id = sl.id
+              and r.shop_id = ${shopId}::uuid
+              and r.sale_id = ${saleId}::uuid
+          ), 0),
+          0
+        )
+      ), 0)::text as remaining
+      from sale_lines sl
+      where sl.sale_id = ${saleId}::uuid
+    `);
+    const remainingQty = Number(
+      (remRes as unknown as { rows: Array<{ remaining: string }> }).rows[0]?.remaining ?? 0,
+    );
+    const newStatus = remainingQty > 1e-9 ? 'PARTIALLY_REFUNDED' : 'REFUNDED';
 
-    const totalRefundedAmount = Number(totalRefunded?.sumAmount ?? 0);
-    const newStatus =
-      totalRefundedAmount >= Number(sale.total) - 1e-6 ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-
+    const reverseDueStr = reverseDue.toFixed(2);
     await tx
       .update(sales)
-      .set({ status: newStatus })
+      .set({
+        status: newStatus,
+        ...(reverseDue > 0
+          ? {
+              dueAmount: sql`greatest(${sales.dueAmount}::numeric - ${reverseDueStr}::numeric, 0)`,
+            }
+          : {}),
+      })
       .where(eq(sales.id, saleId));
 
     if (newStatus === 'REFUNDED') {
@@ -653,8 +744,8 @@ export async function updateSalePromisePayDate(
     .limit(1);
 
   if (!sale) throw AppError.notFound('Sale not found');
-  if (sale.status !== 'COMPLETED') {
-    throw AppError.badRequest('Promise date can only be updated on completed sales');
+  if (sale.status !== 'COMPLETED' && sale.status !== 'PARTIALLY_REFUNDED') {
+    throw AppError.badRequest('Promise date can only be updated on completed or partially refunded sales');
   }
   if (Number(sale.dueAmount) <= 0) {
     throw AppError.badRequest('This sale has no balance due; a promised payment date does not apply');

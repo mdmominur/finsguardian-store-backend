@@ -20,7 +20,13 @@ function mapProductForRole<T extends Record<string, unknown>>(
   auth: FastifyRequest['authUser'],
 ) {
   if (canViewSupplierPricing(auth)) return p;
-  const { unitCost: _u, costMethod: _c, ...rest } = p;
+  const {
+    unitCost: _u,
+    costMethod: _c,
+    effectiveUnitCost: _eu,
+    stockPurchaseValue: _spv,
+    ...rest
+  } = p;
   return rest;
 }
 
@@ -41,6 +47,9 @@ export async function registerProductRoutes(app: FastifyInstance) {
               .enum(['true', 'false'])
               .optional()
               .transform((v) => (v === 'true' ? true : v === 'false' ? false : undefined)),
+            stockStatus: z
+              .enum(['ALL', 'EMPTY', 'LOW', 'LOW_OR_EMPTY', 'IN_STOCK', 'GOOD'])
+              .optional(),
             /** POS / pickers: compute on-hand at this stock location when multi-location is enabled. */
             stockLocationId: z.string().uuid().optional(),
             limit: z.coerce.number().min(1).max(200).default(DEFAULT_LIST_LIMIT),
@@ -63,6 +72,62 @@ export async function registerProductRoutes(app: FastifyInstance) {
         return reply.send({
           items: rows.map((r) => mapProductForRole(r, request.authUser)),
         });
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({
+            code: 'VALIDATION_ERROR',
+            details: e.flatten(),
+          });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  app.get(
+    '/products/inventory-summary',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        const q = z
+          .object({
+            search: z.string().optional(),
+            categoryId: z.string().uuid().optional(),
+            brandId: z.string().uuid().optional(),
+            trackingMode: z.enum(['SERIALIZED', 'QUANTITY']).optional(),
+            active: z.coerce.boolean().optional(),
+            inventoryTracked: z
+              .enum(['true', 'false'])
+              .optional()
+              .transform((v) => (v === 'true' ? true : v === 'false' ? false : undefined)),
+            stockStatus: z
+              .enum(['ALL', 'EMPTY', 'LOW', 'LOW_OR_EMPTY', 'IN_STOCK', 'GOOD'])
+              .optional(),
+            stockLocationId: z.string().uuid().optional(),
+            stockScope: z.enum(['default', 'all_locations']).optional(),
+          })
+          .parse(request.query);
+
+        if (q.inventoryTracked === true) {
+          if (!canUseInventoryDashboard(request.authUser)) {
+            return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+          }
+        } else if (!canBrowseProductsForPos(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+
+        const summary = await productService.getInventorySummary(request.authUser.shopId, q);
+        if (!canViewSupplierPricing(request.authUser)) {
+          return reply.send({
+            ...summary,
+            totalPurchaseValue: null,
+            estimatedProfit: null,
+            estimatedMarginPercent: null,
+            uncostedInStockItems: null,
+          });
+        }
+        return reply.send(summary);
       } catch (e) {
         if (e instanceof z.ZodError) {
           return reply.status(400).send({

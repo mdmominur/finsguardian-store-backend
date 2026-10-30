@@ -47,14 +47,31 @@ export async function listSuppliers(shopId: string, includeBalance: boolean) {
     .where(eq(suppliers.shopId, shopId))
     .orderBy(desc(suppliers.createdAt));
 
-  if (!includeBalance) return rows;
+  if (!includeBalance || rows.length === 0) return rows;
 
-  const out = [];
-  for (const r of rows) {
-    const balance = await supplierBalanceAmount(r.id);
-    out.push({ ...r, balance });
+  const ledgerAggs = await db
+    .select({
+      supplierId: supplierLedgerEntries.supplierId,
+      sum: sql<string>`coalesce(sum(${supplierLedgerEntries.amount}), 0)::text`,
+    })
+    .from(supplierLedgerEntries)
+    .innerJoin(suppliers, eq(suppliers.id, supplierLedgerEntries.supplierId))
+    .where(eq(suppliers.shopId, shopId))
+    .groupBy(supplierLedgerEntries.supplierId);
+
+  const sumBySupplierId = new Map<string, number>();
+  for (const a of ledgerAggs) {
+    sumBySupplierId.set(a.supplierId, Number(a.sum ?? 0));
   }
-  return out;
+
+  return rows.map((r) => {
+    const opening = Number(r.openingBalance);
+    const led = sumBySupplierId.get(r.id) ?? 0;
+    return {
+      ...r,
+      balance: (opening + led).toFixed(2),
+    };
+  });
 }
 
 export async function createSupplier(

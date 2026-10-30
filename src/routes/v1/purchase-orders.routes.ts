@@ -15,12 +15,17 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
       const q = z
         .object({
           completedOnly: z.coerce.boolean().optional(),
+          paymentStatus: z
+            .enum(['ALL', 'DUE_ANY', 'PARTIALLY_PAID', 'UNPAID', 'PAID'])
+            .optional(),
         })
         .parse(request.query);
       const items = await poService.listPurchaseOrdersWithSettlement(request.authUser.shopId, {
         completedOnly: q.completedOnly === true,
+        paymentStatus: q.paymentStatus,
       });
-      return reply.send({ items });
+      const summary = poService.computePoSettlementSummary(items);
+      return reply.send({ items, summary });
     },
   );
 
