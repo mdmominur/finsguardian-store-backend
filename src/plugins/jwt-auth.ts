@@ -4,6 +4,7 @@ import { env } from '../config/env.js';
 import { AppError, sendAppError } from '../lib/errors.js';
 import { parseRole } from '../lib/rbac.js';
 import { sanitizePermissionList } from '../lib/permissions.js';
+import { invalidateShopCache } from '../lib/shop-cache.js';
 import { assertMerchantShopWriteAllowed } from '../services/shop-subscription-access.service.js';
 
 export default fp(async (app) => {
@@ -61,4 +62,16 @@ export default fp(async (app) => {
       }
     },
   );
+
+  app.addHook('onResponse', async (request, reply) => {
+    const shopId = request.authUser?.shopId;
+    if (!shopId) return;
+    const method = request.method;
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      const pathOnly = (request.url ?? '').split('?')[0];
+      if (!pathOnly.startsWith('/api/v1/auth') && reply.statusCode >= 200 && reply.statusCode < 300) {
+        invalidateShopCache(shopId);
+      }
+    }
+  });
 });

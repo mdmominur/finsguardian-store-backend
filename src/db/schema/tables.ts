@@ -420,6 +420,7 @@ export const inventoryBalances = pgTable(
   (t) => [
     primaryKey({ columns: [t.shopId, t.productId, t.locationId] }),
     check('inventory_balances_qty_chk', sql`${t.quantity} >= 0`),
+    index('ix_inventory_balances_shop_loc').on(t.shopId, t.locationId),
   ],
 );
 
@@ -602,6 +603,9 @@ export const supplierPayments = pgTable(
     index('ix_supplier_payments_supplier_time').on(t.supplierId, t.createdAt),
     index('ix_supplier_payments_shop_time').on(t.shopId, t.createdAt),
     index('ix_supplier_payments_finance_account').on(t.financeAccountId),
+    index('ix_supplier_payments_shop_payment_method')
+      .on(t.shopId, t.paymentMethodId)
+      .where(sql`${t.paymentMethodId} IS NOT NULL`),
   ],
 );
 
@@ -652,6 +656,7 @@ export const purchaseOrderLines = pgTable(
     check('po_line_qty_received_chk', sql`${t.qtyReceived} >= 0`),
     check('po_line_received_lte_ordered', sql`${t.qtyReceived} <= ${t.qtyOrdered}`),
     index('ix_po_lines_po').on(t.poId),
+    index('ix_po_lines_product').on(t.productId),
   ],
 );
 
@@ -877,10 +882,14 @@ export const sales = pgTable(
       .on(t.shopId, t.idempotencyKey)
       .where(sql`${t.idempotencyKey} IS NOT NULL AND btrim(${t.idempotencyKey}) <> ''`),
     index('ix_sales_shop_sold_at').on(t.shopId, t.soldAt),
+    index('ix_sales_shop_status_sold_at').on(t.shopId, t.status, t.soldAt),
     index('ix_sales_shop_channel_sold_at').on(t.shopId, t.channel, t.soldAt),
     index('ix_sales_shop_customer')
       .on(t.shopId, t.customerId)
       .where(sql`${t.customerId} IS NOT NULL`),
+    index('ix_sales_shop_customer_due')
+      .on(t.shopId, t.customerId, t.status)
+      .where(sql`${t.dueAmount} > 0`),
     index('ix_sales_shop_cashier_time').on(t.shopId, t.cashierUserId, t.soldAt),
     index('ix_sales_delivery_location').on(t.deliveryLocationId),
   ],
@@ -1041,6 +1050,7 @@ export const refunds = pgTable(
   },
   (t) => [
     index('ix_refunds_shop_time').on(t.shopId, t.createdAt),
+    index('ix_refunds_shop_sale').on(t.shopId, t.saleId),
     index('ix_refunds_payment_method').on(t.paymentMethodId).where(sql`payment_method_id IS NOT NULL`),
   ],
 );
@@ -1062,6 +1072,7 @@ export const refundLines = pgTable(
   (t) => [
     check('refund_lines_qty_chk', sql`${t.qty} > 0`),
     index('ix_refund_lines_refund').on(t.refundId),
+    index('ix_refund_lines_sale_line').on(t.saleLineId),
   ],
 );
 
@@ -1292,6 +1303,9 @@ export const expenses = pgTable(
     check('expenses_amount_chk', sql`${t.amount} >= 0`),
     index('ix_expenses_shop_spent').on(t.shopId, t.spentAt),
     index('ix_expenses_finance_account').on(t.financeAccountId),
+    index('ix_expenses_shop_payment_method')
+      .on(t.shopId, t.paymentMethodId)
+      .where(sql`${t.paymentMethodId} IS NOT NULL`),
   ],
 );
 

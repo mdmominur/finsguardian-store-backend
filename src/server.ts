@@ -1,6 +1,7 @@
 import { buildApp } from './app.js';
 import { env } from './config/env.js';
 import { pool } from './db/client.js';
+import { ensurePerformanceIndexesAndHeal } from './db/ensure-indexes.js';
 import { isMailConfigured, verifyMailConfiguration } from './services/mail.service.js';
 
 async function main() {
@@ -11,6 +12,10 @@ async function main() {
     const client = await pool.connect();
     app.log.info('Database connected successfully');
     client.release();
+
+    await ensurePerformanceIndexesAndHeal().catch((err) => {
+      app.log.warn({ err }, 'Non-fatal warning applying startup performance indexes');
+    });
 
     // 2. Test SMTP connection if configured
     if (isMailConfigured()) {

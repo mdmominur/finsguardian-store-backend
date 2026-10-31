@@ -16,8 +16,10 @@ import {
   purchaseOrders,
   stockLocations,
   suppliers,
+  uoms,
 } from '../db/schema/index.js';
 import { AppError } from '../lib/errors.js';
+import { getOrComputeShopCache } from '../lib/shop-cache.js';
 import { isMultiStockLocationEnabled } from './shop-features.service.js';
 import { getDefaultLocationId, resolveLocationIdOrDefault } from './stock-location.service.js';
 import { generateBatchCode } from './batch.service.js';
@@ -131,6 +133,8 @@ export async function listProductStockByLocations(shopId: string, productId: str
   };
 }
 
+export type StockStatusFilter = 'ALL' | 'EMPTY' | 'LOW' | 'LOW_OR_EMPTY' | 'IN_STOCK' | 'GOOD';
+
 export async function listProducts(
   shopId: string,
   q: {
@@ -141,6 +145,8 @@ export async function listProducts(
     active?: boolean;
     /** When true: serialized products (always IMEI-tracked) OR quantity products with inventory_tracked. */
     inventoryTracked?: boolean;
+    /** Filter by stock level state (EMPTY, LOW, LOW_OR_EMPTY, IN_STOCK, GOOD). */
+    stockStatus?: StockStatusFilter;
     limit: number;
     offset: number;
     /** When multi-location is on, on-hand figures use this stock location (POS picker). */
@@ -154,6 +160,13 @@ export async function listProducts(
   },
 ) {
   const conditions = [eq(products.shopId, shopId)];
+
+  const [defaultLocId, multiLoc] = await Promise.all([
+    getDefaultLocationId(shopId),
+    isMultiStockLocationEnabled(shopId),
+  ]);
+  const effectiveLocId = await resolveLocationIdOrDefault(shopId, q.stockLocationId, multiLoc);
+  const scopeAll = q.stockScope === 'all_locations';
 
   let productIdFilter: string[] | null = null;
 
@@ -224,6 +237,41 @@ export async function listProducts(
     );
   }
 
+  if (q.stockStatus && q.stockStatus !== 'ALL') {
+    const serialLocFilter =
+      !scopeAll && multiLoc
+        ? effectiveLocId === defaultLocId
+          ? sql`and (du.stock_location_id = ${effectiveLocId}::uuid or du.stock_location_id is null)`
+          : sql`and du.stock_location_id = ${effectiveLocId}::uuid`
+        : sql``;
+
+    const qtySubquery = scopeAll
+      ? sql`coalesce((select sum(ib.quantity::numeric) from inventory_balances ib where ib.shop_id = "products"."shop_id" and ib.product_id = "products"."id"), 0)`
+      : sql`coalesce((select ib.quantity::numeric from inventory_balances ib where ib.shop_id = "products"."shop_id" and ib.product_id = "products"."id" and ib.location_id = ${effectiveLocId}::uuid), 0)`;
+
+    const serialSubquery = sql`coalesce((select count(*)::numeric from device_units du where du.shop_id = "products"."shop_id" and du.product_id = "products"."id" and du.status = 'IN_STOCK' and du.blocklisted = false ${serialLocFilter}), 0)`;
+
+    const onHandExpr = sql`(case when "products"."tracking_mode" = 'SERIALIZED' then ${serialSubquery} else ${qtySubquery} end)`;
+    const minStockExpr = sql`greatest(coalesce("products"."min_stock_level"::numeric, 0), 0)`;
+
+    conditions.push(eq(products.isBundle, false));
+    conditions.push(
+      or(eq(products.trackingMode, 'SERIALIZED'), eq(products.inventoryTracked, true))!,
+    );
+
+    if (q.stockStatus === 'EMPTY') {
+      conditions.push(sql`${onHandExpr} <= 0`);
+    } else if (q.stockStatus === 'LOW') {
+      conditions.push(sql`${onHandExpr} > 0 and ${onHandExpr} <= ${minStockExpr}`);
+    } else if (q.stockStatus === 'LOW_OR_EMPTY') {
+      conditions.push(sql`${onHandExpr} <= ${minStockExpr}`);
+    } else if (q.stockStatus === 'IN_STOCK') {
+      conditions.push(sql`${onHandExpr} > 0`);
+    } else if (q.stockStatus === 'GOOD') {
+      conditions.push(sql`${onHandExpr} > 0 and ${onHandExpr} > ${minStockExpr}`);
+    }
+  }
+
   const whereClause = and(...conditions);
 
   const rows = await db
@@ -234,76 +282,463 @@ export async function listProducts(
     .limit(q.limit)
     .offset(q.offset);
 
-  const defaultLocId = await getDefaultLocationId(shopId);
-  const multiLoc = await isMultiStockLocationEnabled(shopId);
-  const effectiveLocId = await resolveLocationIdOrDefault(shopId, q.stockLocationId, multiLoc);
+  if (rows.length === 0) {
+    return [];
+  }
 
-  const scopeAll = q.stockScope === 'all_locations';
+  const quantityProductIds = rows
+    .filter((p) => p.trackingMode === 'QUANTITY')
+    .map((p) => p.id);
+  const serializedProductIds = rows
+    .filter((p) => p.trackingMode !== 'QUANTITY')
+    .map((p) => p.id);
+  const allPageProductIds = rows.map((p) => p.id);
+  const uomIds = [...new Set(rows.map((p) => p.uomId).filter((id): id is string => Boolean(id)))];
 
-  const withStock = await Promise.all(
-    rows.map(async (p) => {
-      let quantityOnHand = '0';
-      if (p.trackingMode === 'QUANTITY') {
-        if (scopeAll) {
-          const [sumRow] = await db
+  const [qtyRows, serialRows, poAvgRows, uomRows] = await Promise.all([
+    quantityProductIds.length === 0
+      ? Promise.resolve([] as Array<{ productId: string; quantity: string }>)
+      : scopeAll
+        ? db
             .select({
-              sum: sql<string>`coalesce(sum(${inventoryBalances.quantity}::numeric), 0)::text`,
+              productId: inventoryBalances.productId,
+              quantity: sql<string>`coalesce(sum(${inventoryBalances.quantity}::numeric), 0)::text`,
             })
             .from(inventoryBalances)
             .where(
               and(
                 eq(inventoryBalances.shopId, shopId),
-                eq(inventoryBalances.productId, p.id),
+                inArray(inventoryBalances.productId, quantityProductIds),
               ),
-            );
-          quantityOnHand = sumRow?.sum ?? '0';
-        } else {
-          const [b] = await db
-            .select({ quantity: inventoryBalances.quantity })
+            )
+            .groupBy(inventoryBalances.productId)
+        : db
+            .select({
+              productId: inventoryBalances.productId,
+              quantity: inventoryBalances.quantity,
+            })
             .from(inventoryBalances)
             .where(
               and(
                 eq(inventoryBalances.shopId, shopId),
-                eq(inventoryBalances.productId, p.id),
                 eq(inventoryBalances.locationId, effectiveLocId),
+                inArray(inventoryBalances.productId, quantityProductIds),
               ),
-            )
-            .limit(1);
-          quantityOnHand = b?.quantity ?? '0';
-        }
-      } else {
-        let duWhere = and(
-          eq(deviceUnits.shopId, shopId),
-          eq(deviceUnits.productId, p.id),
-          eq(deviceUnits.status, 'IN_STOCK'),
-          eq(deviceUnits.blocklisted, false),
-        );
-        if (!scopeAll && multiLoc) {
-          const atLocation = eq(deviceUnits.stockLocationId, effectiveLocId);
-          if (effectiveLocId === defaultLocId) {
-            duWhere = and(duWhere, or(atLocation, isNull(deviceUnits.stockLocationId))!);
-          } else {
-            duWhere = and(duWhere, atLocation);
+            ),
+
+    serializedProductIds.length === 0
+      ? Promise.resolve(
+          [] as Array<{
+            productId: string;
+            n: number;
+            costedCount: number;
+            poCostSum: string;
+          }>,
+        )
+      : (() => {
+          let duWhere = and(
+            eq(deviceUnits.shopId, shopId),
+            inArray(deviceUnits.productId, serializedProductIds),
+            eq(deviceUnits.status, 'IN_STOCK'),
+            eq(deviceUnits.blocklisted, false),
+          );
+          if (!scopeAll && multiLoc) {
+            const atLocation = eq(deviceUnits.stockLocationId, effectiveLocId);
+            if (effectiveLocId === defaultLocId) {
+              duWhere = and(duWhere, or(atLocation, isNull(deviceUnits.stockLocationId))!);
+            } else {
+              duWhere = and(duWhere, atLocation);
+            }
           }
-        }
-        const [c] = await db
-          .select({ n: count() })
-          .from(deviceUnits)
-          .where(duWhere);
-        quantityOnHand = String(c?.n ?? 0);
+          return db
+            .select({
+              productId: deviceUnits.productId,
+              n: count(),
+              costedCount: sql<number>`count(case when coalesce(${purchaseOrderLines.unitCost}::numeric, 0) > 0 then 1 else null end)::int`,
+              poCostSum: sql<string>`coalesce(sum(case when coalesce(${purchaseOrderLines.unitCost}::numeric, 0) > 0 then ${purchaseOrderLines.unitCost}::numeric else 0 end), 0)::text`,
+            })
+            .from(deviceUnits)
+            .leftJoin(purchaseOrderLines, eq(purchaseOrderLines.id, deviceUnits.receivedPoLineId))
+            .where(duWhere)
+            .groupBy(deviceUnits.productId);
+        })(),
+
+    allPageProductIds.length === 0
+      ? Promise.resolve([] as Array<{ productId: string; avgCost: string }>)
+      : db
+          .select({
+            productId: purchaseOrderLines.productId,
+            avgCost: sql<string>`(
+              case
+                when sum(${purchaseOrderLines.qtyReceived}::numeric) > 0
+                  then sum(${purchaseOrderLines.qtyReceived}::numeric * greatest(${purchaseOrderLines.unitCost}::numeric, 0))
+                       / sum(${purchaseOrderLines.qtyReceived}::numeric)
+                else avg(greatest(${purchaseOrderLines.unitCost}::numeric, 0))
+              end
+            )::text`,
+          })
+          .from(purchaseOrderLines)
+          .innerJoin(purchaseOrders, eq(purchaseOrders.id, purchaseOrderLines.poId))
+          .where(
+            and(
+              eq(purchaseOrders.shopId, shopId),
+              ne(purchaseOrders.status, 'CANCELLED'),
+              inArray(purchaseOrderLines.productId, allPageProductIds),
+              sql`${purchaseOrderLines.unitCost}::numeric > 0`,
+            ),
+          )
+          .groupBy(purchaseOrderLines.productId),
+
+    uomIds.length === 0
+      ? Promise.resolve([] as Array<{ id: string; name: string; symbol: string | null }>)
+      : db
+          .select({
+            id: uoms.id,
+            name: uoms.name,
+            symbol: uoms.symbol,
+          })
+          .from(uoms)
+          .where(and(eq(uoms.shopId, shopId), inArray(uoms.id, uomIds))),
+  ]);
+
+  const stockByProductId = new Map<string, string>();
+  for (const r of qtyRows) {
+    stockByProductId.set(r.productId, String(r.quantity ?? '0'));
+  }
+  const serialMetaByProductId = new Map<
+    string,
+    { n: number; costedCount: number; poCostSum: number }
+  >();
+  for (const r of serialRows) {
+    stockByProductId.set(r.productId, String(r.n ?? 0));
+    serialMetaByProductId.set(r.productId, {
+      n: Number(r.n ?? 0),
+      costedCount: Number(r.costedCount ?? 0),
+      poCostSum: Number(r.poCostSum ?? 0),
+    });
+  }
+  const poAvgByProductId = new Map<string, number>();
+  for (const r of poAvgRows) {
+    const v = Number(r.avgCost ?? 0);
+    if (Number.isFinite(v) && v > 0) poAvgByProductId.set(r.productId, v);
+  }
+  const uomById = new Map<string, { name: string; symbol: string | null }>();
+  for (const u of uomRows) {
+    uomById.set(u.id, { name: u.name, symbol: u.symbol });
+  }
+
+  return rows.map((p) => {
+    const quantityOnHand = stockByProductId.get(p.id) ?? '0';
+    const min = Number(p.minStockLevel || 0);
+    const qNum = Math.max(0, Number(quantityOnHand) || 0);
+    let stockBadge: 'EMPTY' | 'LOW' | 'GOOD' = 'GOOD';
+    if (qNum <= 0) stockBadge = 'EMPTY';
+    else if (qNum <= min) stockBadge = 'LOW';
+
+    const bookCost = Math.max(0, Number(p.unitCost) || 0);
+    const poFallbackCost = poAvgByProductId.get(p.id) ?? 0;
+    const baseUnitCost = bookCost > 0 ? bookCost : poFallbackCost;
+
+    let stockPurchaseValueNum = 0;
+    let effectiveUnitCostNum = baseUnitCost;
+
+    if (!p.isBundle) {
+      if (p.trackingMode === 'SERIALIZED') {
+        const sm = serialMetaByProductId.get(p.id);
+        const poSum = sm?.poCostSum ?? 0;
+        const costedCnt = sm?.costedCount ?? 0;
+        const uncostedUnits = Math.max(0, qNum - costedCnt);
+        stockPurchaseValueNum = poSum + uncostedUnits * baseUnitCost;
+        effectiveUnitCostNum = qNum > 0 ? stockPurchaseValueNum / qNum : baseUnitCost;
+      } else if (p.inventoryTracked !== false) {
+        stockPurchaseValueNum = qNum * baseUnitCost;
       }
+    }
 
-      const min = Number(p.minStockLevel || 0);
-      const qNum = Number(quantityOnHand);
-      let stockBadge: 'EMPTY' | 'LOW' | 'GOOD' = 'GOOD';
-      if (qNum <= 0) stockBadge = 'EMPTY';
-      else if (qNum <= min) stockBadge = 'LOW';
+    const listPriceNum = Math.max(0, Number(p.listPrice) || 0);
+    const estimatedSalesValueNum =
+      !p.isBundle && (p.trackingMode === 'SERIALIZED' || p.inventoryTracked !== false)
+        ? qNum * listPriceNum
+        : 0;
 
-      return { ...p, quantityOnHand, stockBadge };
-    }),
-  );
+    const uom = p.uomId ? uomById.get(p.uomId) : undefined;
 
-  return withStock;
+    return {
+      ...p,
+      uomName: uom?.name ?? null,
+      uomSymbol: uom?.symbol ?? null,
+      quantityOnHand,
+      stockBadge,
+      effectiveUnitCost: effectiveUnitCostNum.toFixed(2),
+      stockPurchaseValue: stockPurchaseValueNum.toFixed(2),
+      estimatedSalesValue: estimatedSalesValueNum.toFixed(2),
+    };
+  });
+}
+
+export type InventorySummaryStats = {
+  totalItems: number;
+  bundleCount: number;
+  inStockItems: number;
+  lowStockItems: number;
+  outOfStockItems: number;
+  totalQuantity: string;
+  quantityTrackedTotal: string;
+  serializedUnitsTotal: number;
+  totalPurchaseValue: string | null;
+  estimatedSalesValue: string;
+  estimatedProfit: string | null;
+  estimatedMarginPercent: string | null;
+  uncostedInStockItems: number | null;
+  unpricedInStockItems: number;
+};
+
+function formatCleanQty(val: string | number): string {
+  const n = Number(val);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (Math.abs(n - Math.round(n)) < 1e-6) return String(Math.round(n));
+  return n.toFixed(3).replace(/\.?0+$/, '');
+}
+
+/**
+ * Single-query inventory valuation & summary across all matching products.
+ * Handles QUANTITY + SERIALIZED (per-unit PO line cost + product unitCost + PO average fallback),
+ * excludes virtual bundles from physical stock sums, guards against negative numbers,
+ * and caches per-shop for 60s with automatic mutation invalidation.
+ */
+export async function getInventorySummary(
+  shopId: string,
+  q: {
+    search?: string;
+    categoryId?: string;
+    brandId?: string;
+    trackingMode?: 'SERIALIZED' | 'QUANTITY';
+    active?: boolean;
+    inventoryTracked?: boolean;
+    stockStatus?: StockStatusFilter;
+    stockLocationId?: string;
+    stockScope?: 'default' | 'all_locations';
+  },
+): Promise<InventorySummaryStats> {
+  const cacheKey = `inventory:summary:${JSON.stringify({
+    search: q.search?.trim() || '',
+    categoryId: q.categoryId || '',
+    brandId: q.brandId || '',
+    trackingMode: q.trackingMode || '',
+    active: q.active ?? true,
+    inventoryTracked: q.inventoryTracked ?? null,
+    stockStatus: q.stockStatus || 'ALL',
+    stockLocationId: q.stockLocationId || '',
+    stockScope: q.stockScope || 'default',
+  })}`;
+
+  return getOrComputeShopCache(shopId, cacheKey, 60_000, async () => {
+    const [defaultLocId, multiLoc] = await Promise.all([
+      getDefaultLocationId(shopId),
+      isMultiStockLocationEnabled(shopId),
+    ]);
+    const effectiveLocId = await resolveLocationIdOrDefault(shopId, q.stockLocationId, multiLoc);
+    const scopeAll = q.stockScope === 'all_locations';
+
+    const activeFilter = q.active !== undefined ? sql`and p.active = ${q.active}` : sql``;
+    const categoryFilter = q.categoryId ? sql`and p.category_id = ${q.categoryId}::uuid` : sql``;
+    const brandFilter = q.brandId ? sql`and p.brand_id = ${q.brandId}::uuid` : sql``;
+    const trackingFilter = q.trackingMode ? sql`and p.tracking_mode = ${q.trackingMode}` : sql``;
+    const inventoryTrackedFilter =
+      q.inventoryTracked === true
+        ? sql`and (p.tracking_mode = 'SERIALIZED' or p.inventory_tracked = true)`
+        : q.inventoryTracked === false
+          ? sql`and p.tracking_mode = 'QUANTITY' and p.inventory_tracked = false`
+          : sql``;
+
+    const searchTrimmed = q.search?.trim();
+    const searchPattern = searchTrimmed ? `%${searchTrimmed}%` : '';
+    const searchFilter = searchTrimmed
+      ? sql`and (p.name ilike ${searchPattern} or p.sku ilike ${searchPattern} or coalesce(p.barcode, '') ilike ${searchPattern})`
+      : sql``;
+
+    const serialLocationFilter =
+      !scopeAll && multiLoc
+        ? effectiveLocId === defaultLocId
+          ? sql`and (du.stock_location_id = ${effectiveLocId}::uuid or du.stock_location_id is null)`
+          : sql`and du.stock_location_id = ${effectiveLocId}::uuid`
+        : sql``;
+
+    const qtyStockCte = scopeAll
+      ? sql`
+          select
+            ib.product_id,
+            greatest(coalesce(sum(ib.quantity::numeric), 0), 0) as qty
+          from inventory_balances ib
+          where ib.shop_id = ${shopId}::uuid
+          group by ib.product_id
+        `
+      : sql`
+          select
+            ib.product_id,
+            greatest(coalesce(ib.quantity::numeric, 0), 0) as qty
+          from inventory_balances ib
+          where ib.shop_id = ${shopId}::uuid
+            and ib.location_id = ${effectiveLocId}::uuid
+        `;
+
+    const statusCondSql =
+      q.stockStatus === 'EMPTY'
+        ? sql`and not is_bundle and on_hand <= 0`
+        : q.stockStatus === 'LOW'
+          ? sql`and not is_bundle and on_hand > 0 and on_hand <= min_stock`
+          : q.stockStatus === 'LOW_OR_EMPTY'
+            ? sql`and not is_bundle and on_hand <= min_stock`
+            : q.stockStatus === 'IN_STOCK'
+              ? sql`and not is_bundle and on_hand > 0`
+              : q.stockStatus === 'GOOD'
+                ? sql`and not is_bundle and on_hand > 0 and on_hand > min_stock`
+                : sql`and not is_bundle`;
+
+    const res = (await db.execute(sql`
+      with filtered_products as (
+        select
+          p.id,
+          p.tracking_mode,
+          p.inventory_tracked,
+          p.is_bundle,
+          greatest(coalesce(p.min_stock_level::numeric, 0), 0) as min_stock,
+          greatest(coalesce(p.unit_cost::numeric, 0), 0) as book_cost,
+          greatest(coalesce(p.list_price::numeric, 0), 0) as list_price
+        from products p
+        where p.shop_id = ${shopId}::uuid
+          ${activeFilter}
+          ${categoryFilter}
+          ${brandFilter}
+          ${trackingFilter}
+          ${inventoryTrackedFilter}
+          ${searchFilter}
+      ),
+      qty_stock as (
+        ${qtyStockCte}
+      ),
+      serial_stock as (
+        select
+          du.product_id,
+          count(*)::numeric as cnt,
+          count(*) filter (where coalesce(pol.unit_cost::numeric, 0) > 0)::numeric as costed_cnt,
+          coalesce(
+            sum(
+              case
+                when coalesce(pol.unit_cost::numeric, 0) > 0 then pol.unit_cost::numeric
+                else 0
+              end
+            ),
+            0
+          ) as po_cost_sum
+        from device_units du
+        inner join filtered_products fp on fp.id = du.product_id
+        left join purchase_order_lines pol on pol.id = du.received_po_line_id
+        where du.shop_id = ${shopId}::uuid
+          and du.status = 'IN_STOCK'
+          and du.blocklisted = false
+          ${serialLocationFilter}
+        group by du.product_id
+      ),
+      po_avg_cost as (
+        select
+          pol.product_id,
+          case
+            when sum(pol.qty_received::numeric) > 0
+              then sum(pol.qty_received::numeric * greatest(pol.unit_cost::numeric, 0))
+                   / sum(pol.qty_received::numeric)
+            else avg(greatest(pol.unit_cost::numeric, 0))
+          end as avg_cost
+        from purchase_order_lines pol
+        inner join purchase_orders po on po.id = pol.po_id
+        inner join filtered_products fp on fp.id = pol.product_id
+        where po.shop_id = ${shopId}::uuid
+          and po.status <> 'CANCELLED'
+          and pol.unit_cost::numeric > 0
+        group by pol.product_id
+      ),
+      product_rollup as (
+        select
+          fp.id,
+          fp.tracking_mode,
+          fp.is_bundle,
+          fp.min_stock,
+          fp.list_price,
+          case
+            when fp.is_bundle then 0::numeric
+            when fp.tracking_mode = 'SERIALIZED' then coalesce(ss.cnt, 0)
+            when fp.inventory_tracked = false then 0::numeric
+            else coalesce(qs.qty, 0)
+          end as on_hand,
+          case
+            when fp.is_bundle then 0::numeric
+            when fp.tracking_mode = 'SERIALIZED' then
+              coalesce(ss.po_cost_sum, 0)
+              + greatest(coalesce(ss.cnt, 0) - coalesce(ss.costed_cnt, 0), 0)
+                * coalesce(nullif(fp.book_cost, 0), coalesce(pac.avg_cost, 0))
+            when fp.inventory_tracked = false then 0::numeric
+            else
+              coalesce(qs.qty, 0) * coalesce(nullif(fp.book_cost, 0), coalesce(pac.avg_cost, 0))
+          end as stock_purchase_val
+        from filtered_products fp
+        left join qty_stock qs on qs.product_id = fp.id
+        left join serial_stock ss on ss.product_id = fp.id
+        left join po_avg_cost pac on pac.product_id = fp.id
+      )
+      select
+        count(*) filter (where true ${statusCondSql})::int as "totalItems",
+        count(*) filter (where is_bundle)::int as "bundleCount",
+        count(*) filter (where not is_bundle and on_hand > 0)::int as "inStockItems",
+        count(*) filter (where not is_bundle and on_hand > 0 and on_hand <= min_stock)::int as "lowStockItems",
+        count(*) filter (where not is_bundle and on_hand <= 0)::int as "outOfStockItems",
+        coalesce(sum(on_hand) filter (where true ${statusCondSql}), 0)::text as "totalQuantity",
+        coalesce(sum(on_hand) filter (where tracking_mode = 'QUANTITY' ${statusCondSql}), 0)::text as "quantityTrackedTotal",
+        coalesce(sum(on_hand) filter (where tracking_mode = 'SERIALIZED' ${statusCondSql}), 0)::int as "serializedUnitsTotal",
+        round(coalesce(sum(stock_purchase_val) filter (where on_hand > 0 ${statusCondSql}), 0), 2)::text as "totalPurchaseValue",
+        round(coalesce(sum(on_hand * list_price) filter (where on_hand > 0 ${statusCondSql}), 0), 2)::text as "estimatedSalesValue",
+        count(*) filter (where on_hand > 0 and stock_purchase_val <= 0 ${statusCondSql})::int as "uncostedInStockItems",
+        count(*) filter (where on_hand > 0 and list_price <= 0 ${statusCondSql})::int as "unpricedInStockItems"
+      from product_rollup
+    `)) as unknown as {
+      rows: Array<{
+        totalItems: number;
+        bundleCount: number;
+        inStockItems: number;
+        lowStockItems: number;
+        outOfStockItems: number;
+        totalQuantity: string;
+        quantityTrackedTotal: string;
+        serializedUnitsTotal: number;
+        totalPurchaseValue: string;
+        estimatedSalesValue: string;
+        uncostedInStockItems: number;
+        unpricedInStockItems: number;
+      }>;
+    };
+
+    const row = res.rows[0];
+    const purchaseVal = Number(row?.totalPurchaseValue ?? 0);
+    const salesVal = Number(row?.estimatedSalesValue ?? 0);
+    const profitVal = salesVal - purchaseVal;
+    const marginPct = salesVal > 0 ? ((profitVal / salesVal) * 100).toFixed(1) : null;
+
+    return {
+      totalItems: Number(row?.totalItems ?? 0),
+      bundleCount: Number(row?.bundleCount ?? 0),
+      inStockItems: Number(row?.inStockItems ?? 0),
+      lowStockItems: Number(row?.lowStockItems ?? 0),
+      outOfStockItems: Number(row?.outOfStockItems ?? 0),
+      totalQuantity: formatCleanQty(row?.totalQuantity ?? '0'),
+      quantityTrackedTotal: formatCleanQty(row?.quantityTrackedTotal ?? '0'),
+      serializedUnitsTotal: Number(row?.serializedUnitsTotal ?? 0),
+      totalPurchaseValue: purchaseVal.toFixed(2),
+      estimatedSalesValue: salesVal.toFixed(2),
+      estimatedProfit: profitVal.toFixed(2),
+      estimatedMarginPercent: marginPct,
+      uncostedInStockItems: Number(row?.uncostedInStockItems ?? 0),
+      unpricedInStockItems: Number(row?.unpricedInStockItems ?? 0),
+    };
+  });
 }
 
 function generateBarcode(): string {

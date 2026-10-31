@@ -288,6 +288,35 @@ export async function receivePurchaseOrder(
             createdBy: userId,
           });
         }
+
+        if (p.costMethod === 'MOVING_AVG' || Number(p.unitCost) <= 0) {
+          const [serialStockAgg] = await tx
+            .select({ n: count() })
+            .from(deviceUnits)
+            .where(
+              and(
+                eq(deviceUnits.shopId, shopId),
+                eq(deviceUnits.productId, p.id),
+                eq(deviceUnits.status, 'IN_STOCK'),
+                eq(deviceUnits.blocklisted, false),
+              ),
+            );
+          const totalInStockNow = Number(serialStockAgg?.n ?? qty);
+          const prevInStock = Math.max(0, totalInStockNow - qty);
+          const oldCost = Number(p.unitCost);
+          const incomingCost = Number(line.unitCost);
+          const newSerialUnitCost =
+            totalInStockNow > 0 && oldCost > 0 && prevInStock > 0
+              ? ((prevInStock * oldCost + qty * incomingCost) / totalInStockNow).toFixed(2)
+              : incomingCost.toFixed(2);
+          await tx
+            .update(products)
+            .set({
+              unitCost: newSerialUnitCost,
+              updatedAt: new Date(),
+            })
+            .where(eq(products.id, p.id));
+        }
       } else {
         // For QUANTITY items, allow receiving into one or more batches.
         // If caller provided batches, validate that their sum matches `qty`.
@@ -328,15 +357,15 @@ export async function receivePurchaseOrder(
           )
           .limit(1);
 
-        const q0 = Number(existingBal?.quantity ?? 0);
+        const q0 = Math.max(0, Number(existingBal?.quantity ?? 0));
         const incoming = qty;
         const newQty = q0 + incoming;
         const oldCost = Number(p.unitCost);
         const incomingCost = Number(line.unitCost);
         const newUnitCost =
-          newQty > 0
+          newQty > 0 && oldCost > 0 && q0 > 0
             ? ((q0 * oldCost + incoming * incomingCost) / newQty).toFixed(2)
-            : line.unitCost;
+            : incomingCost.toFixed(2);
 
         await tx
           .insert(inventoryBalances)
@@ -524,10 +553,99 @@ export async function receivePurchaseOrder(
   });
 }
 
+export type PoPaymentFilter = 'ALL' | 'DUE_ANY' | 'PARTIALLY_PAID' | 'UNPAID' | 'PAID';
+
 export type ListPurchaseOrdersOpts = {
   /** Only fully received POs (for returns, payments, filters). Excludes PARTIALLY_RECEIVED / DRAFT / SENT. */
   completedOnly?: boolean;
+  /** Filter by settlement payment status. */
+  paymentStatus?: PoPaymentFilter;
 };
+
+export type PoSettlementSummary = {
+  totalPayableReceived: string;
+  totalPaidAllocated: string;
+  totalPendingDue: string;
+  duePoCount: number;
+  partiallyPaidPoCount: number;
+  partiallyPaidAmountPaid: string;
+  partiallyPaidPendingDue: string;
+  unpaidPoCount: number;
+  unpaidPendingDue: string;
+  fullyPaidPoCount: number;
+};
+
+export function classifyPoPaymentState(settlement: {
+  owedGross: string;
+  paidAllocated: string;
+  due: string;
+}): 'NONE' | 'UNPAID' | 'PARTIALLY_PAID' | 'PAID' {
+  const owed = Number(settlement.owedGross) || 0;
+  const paid = Number(settlement.paidAllocated) || 0;
+  const due = Number(settlement.due) || 0;
+  if (owed <= 0.004) return 'NONE';
+  if (due <= 0.004) return 'PAID';
+  if (paid <= 0.004) return 'UNPAID';
+  return 'PARTIALLY_PAID';
+}
+
+export function computePoSettlementSummary(
+  rows: Array<{
+    status: string;
+    settlement: { owedGross: string; paidAllocated: string; due: string };
+  }>,
+): PoSettlementSummary {
+  let totalPayable = 0;
+  let totalPaid = 0;
+  let totalPendingDue = 0;
+  let duePoCount = 0;
+  let partiallyPaidPoCount = 0;
+  let partiallyPaidAmountPaid = 0;
+  let partiallyPaidPendingDue = 0;
+  let unpaidPoCount = 0;
+  let unpaidPendingDue = 0;
+  let fullyPaidPoCount = 0;
+
+  for (const r of rows) {
+    if (r.status === 'CANCELLED') continue;
+    const owed = Math.max(0, Number(r.settlement?.owedGross) || 0);
+    const paid = Math.max(0, Number(r.settlement?.paidAllocated) || 0);
+    const due = Math.max(0, Number(r.settlement?.due) || 0);
+    const state = classifyPoPaymentState(r.settlement);
+
+    if (state === 'NONE') continue;
+
+    totalPayable += owed;
+    totalPaid += paid;
+    totalPendingDue += due;
+
+    if (state === 'PAID') {
+      fullyPaidPoCount += 1;
+    } else if (state === 'PARTIALLY_PAID') {
+      duePoCount += 1;
+      partiallyPaidPoCount += 1;
+      partiallyPaidAmountPaid += paid;
+      partiallyPaidPendingDue += due;
+    } else if (state === 'UNPAID') {
+      duePoCount += 1;
+      unpaidPoCount += 1;
+      unpaidPendingDue += due;
+    }
+  }
+
+  return {
+    totalPayableReceived: totalPayable.toFixed(2),
+    totalPaidAllocated: totalPaid.toFixed(2),
+    totalPendingDue: totalPendingDue.toFixed(2),
+    duePoCount,
+    partiallyPaidPoCount,
+    partiallyPaidAmountPaid: partiallyPaidAmountPaid.toFixed(2),
+    partiallyPaidPendingDue: partiallyPaidPendingDue.toFixed(2),
+    unpaidPoCount,
+    unpaidPendingDue: unpaidPendingDue.toFixed(2),
+    fullyPaidPoCount,
+  };
+}
 
 export async function listPurchaseOrders(shopId: string, opts?: ListPurchaseOrdersOpts) {
   const conds = [eq(purchaseOrders.shopId, shopId)];
@@ -545,10 +663,25 @@ export async function listPurchaseOrdersWithSettlement(shopId: string, opts?: Li
   const pos = await listPurchaseOrders(shopId, opts);
   const ids = pos.map((p) => p.id);
   const settlement = await settlementByPoIds(ids);
-  return pos.map((po) => ({
+  const allRows = pos.map((po) => ({
     ...po,
     settlement: settlement.get(po.id)!,
   }));
+
+  const pf = opts?.paymentStatus;
+  if (!pf || pf === 'ALL') {
+    return allRows;
+  }
+
+  return allRows.filter((r) => {
+    if (r.status === 'CANCELLED') return false;
+    const state = classifyPoPaymentState(r.settlement);
+    if (pf === 'DUE_ANY') return state === 'UNPAID' || state === 'PARTIALLY_PAID';
+    if (pf === 'PARTIALLY_PAID') return state === 'PARTIALLY_PAID';
+    if (pf === 'UNPAID') return state === 'UNPAID';
+    if (pf === 'PAID') return state === 'PAID';
+    return true;
+  });
 }
 
 export async function getPurchaseOrder(shopId: string, poId: string) {

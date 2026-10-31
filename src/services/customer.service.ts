@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, gt, ilike, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, ilike, inArray, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   customerAccounts,
@@ -49,7 +49,7 @@ export async function listCustomers(
 
   if (q.dueOnly) {
     conditions.push(
-      sql`(select coalesce(sum(${customerLedgerEntries.amount}), 0)::numeric from ${customerLedgerEntries} where ${customerLedgerEntries.customerId} = ${customers.id}) > 0`,
+      sql`(select coalesce(sum(cle.amount), 0)::numeric from ${customerLedgerEntries} cle where cle.customer_id = "customers"."id") > 0`,
     );
   }
 
@@ -66,8 +66,13 @@ export async function listCustomers(
       updatedAt: customers.updatedAt,
       hasWebsiteAccount: sql<boolean>`exists (
         select 1 from ${customerAccounts} ca
-        where ca.customer_id = ${customers.id} and ca.shop_id = ${customers.shopId}
+        where ca.customer_id = "customers"."id" and ca.shop_id = "customers"."shop_id"
       )`,
+      balance: sql<string>`coalesce((
+        select sum(cle.amount)
+        from ${customerLedgerEntries} cle
+        where cle.customer_id = "customers"."id"
+      ), 0)::text`,
     })
     .from(customers)
     .where(and(...conditions))
@@ -75,11 +80,7 @@ export async function listCustomers(
     .limit(q.limit)
     .offset(q.offset);
 
-  const withBal = [];
-  for (const c of rows) {
-    withBal.push({ ...c, balance: await customerBalance(c.id) });
-  }
-  return withBal;
+  return rows;
 }
 
 export async function createCustomer(
@@ -153,7 +154,7 @@ export async function listCustomerOpenDueSales(shopId: string, customerId: strin
       and(
         eq(sales.shopId, shopId),
         eq(sales.customerId, customerId),
-        eq(sales.status, 'COMPLETED'),
+        inArray(sales.status, ['COMPLETED', 'PARTIALLY_REFUNDED']),
         gt(sales.dueAmount, '0'),
       ),
     )
@@ -248,7 +249,7 @@ export async function recordCustomerPayment(
               eq(sales.id, a.saleId),
               eq(sales.shopId, shopId),
               eq(sales.customerId, customerId),
-              eq(sales.status, 'COMPLETED'),
+              inArray(sales.status, ['COMPLETED', 'PARTIALLY_REFUNDED']),
               gt(sales.dueAmount, '0'),
             ),
           )
@@ -310,7 +311,7 @@ export async function recordCustomerPayment(
           and(
             eq(sales.shopId, shopId),
             eq(sales.customerId, customerId),
-            eq(sales.status, 'COMPLETED'),
+            inArray(sales.status, ['COMPLETED', 'PARTIALLY_REFUNDED']),
             gt(sales.dueAmount, '0'),
           ),
         )
