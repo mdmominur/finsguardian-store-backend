@@ -1507,6 +1507,12 @@ export const storefrontFulfillmentOrders = pgTable(
       onDelete: 'set null',
     }),
     deliveryCharge: numeric('delivery_charge', { precision: 14, scale: 2 }).notNull().default('0'),
+    recipientName: text('recipient_name'),
+    recipientPhone: text('recipient_phone'),
+    shippingAddressText: text('shipping_address_text'),
+    customerNote: text('customer_note'),
+    cancelledReason: text('cancelled_reason'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true }),
     status: text('status').notNull().default('PROCESSING'),
     saleId: uuid('sale_id').references(() => sales.id, { onDelete: 'set null' }),
     publicRef: text('public_ref').notNull(),
@@ -1546,6 +1552,48 @@ export const storefrontFulfillmentOrderLines = pgTable(
   ],
 );
 
+export const productReviews = pgTable(
+  'product_reviews',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    shopId: uuid('shop_id')
+      .notNull()
+      .references(() => shops.id, { onDelete: 'cascade' }),
+    productId: uuid('product_id')
+      .notNull()
+      .references(() => products.id, { onDelete: 'cascade' }),
+    customerId: uuid('customer_id').references(() => customers.id, { onDelete: 'set null' }),
+    reviewerName: text('reviewer_name').notNull(),
+    rating: integer('rating').notNull(),
+    title: text('title'),
+    comment: text('comment').notNull(),
+    isVerifiedPurchase: boolean('is_verified_purchase').notNull().default(false),
+    status: text('status').notNull().default('APPROVED'),
+    isFeaturedOnHome: boolean('is_featured_on_home').notNull().default(false),
+    merchantReply: text('merchant_reply'),
+    repliedAt: timestamp('replied_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check('product_reviews_rating_chk', sql`${t.rating} >= 1 AND ${t.rating} <= 5`),
+    check(
+      'product_reviews_status_chk',
+      sql`${t.status} IN ('PENDING', 'APPROVED', 'REJECTED')`,
+    ),
+    index('ix_product_reviews_shop_product_status').on(
+      t.shopId,
+      t.productId,
+      t.status,
+      t.createdAt,
+    ),
+    index('ix_product_reviews_shop_status_created').on(t.shopId, t.status, t.createdAt),
+    index('ix_product_reviews_shop_featured_home')
+      .on(t.shopId, t.isFeaturedOnHome, t.status, t.createdAt)
+      .where(sql`${t.isFeaturedOnHome} = true`),
+  ],
+);
+
 export const shopSubscriptionPayments = pgTable(
   'shop_subscription_payments',
   {
@@ -1568,3 +1616,46 @@ export const shopSubscriptionPayments = pgTable(
   },
   (t) => [index('ix_shop_sub_pay_shop_created').on(t.shopId, t.createdAt)],
 );
+
+/**
+ * Packet "fingerprint" captured once while creating/updating a product, so POS can resolve a
+ * scanned packet with a plain indexed lookup (no recognition work at sell time).
+ * Mirrors docs/sql/047_product_scan_profiles.sql (text columns dropped in 048).
+ */
+export const productScanProfiles = pgTable(
+  'product_scan_profiles',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    shopId: uuid('shop_id')
+      .notNull()
+      .references(() => shops.id, { onDelete: 'cascade' }),
+    productId: uuid('product_id')
+      .notNull()
+      .references(() => products.id, { onDelete: 'cascade' }),
+    /** Packet barcode as printed (EAN-13 / UPC / CODE-128 / QR payload), when the packet has one. */
+    barcode: text('barcode'),
+    /** Perceptual hash of the packet front — tiebreaker only. */
+    imagePhash: text('image_phash'),
+    /** Small packet thumbnail shown next to the enrolled packet. */
+    thumbUrl: text('thumb_url'),
+    /** PACKET_SCAN | MANUAL | IMPORT */
+    source: text('source').notNull().default('PACKET_SCAN'),
+    /** Newest capture for the product; older packaging revisions flip to false. */
+    isCurrent: boolean('is_current').notNull().default(true),
+    createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'product_scan_profiles_source_chk',
+      sql`${t.source} IN ('PACKET_SCAN', 'MANUAL', 'IMPORT')`,
+    ),
+    uniqueIndex('ux_psp_shop_barcode')
+      .on(t.shopId, t.barcode)
+      .where(sql`${t.barcode} IS NOT NULL AND btrim(${t.barcode}) <> ''`),
+    uniqueIndex('ux_psp_current_per_product').on(t.productId).where(sql`${t.isCurrent}`),
+    index('ix_psp_shop_current').on(t.shopId, t.isCurrent),
+  ],
+);
+

@@ -9,6 +9,7 @@ import {
   hasPermission,
 } from '../../lib/permissions.js';
 import * as productService from '../../services/product.service.js';
+import * as productScanService from '../../services/product-scan.service.js';
 import * as inventoryHistoryService from '../../services/inventory-history.service.js';
 import * as productPurchaseInsightsService from '../../services/product-purchase-insights.service.js';
 import { isMultiStockLocationEnabled } from '../../services/shop-features.service.js';
@@ -435,6 +436,150 @@ export async function registerProductRoutes(app: FastifyInstance) {
             code: 'VALIDATION_ERROR',
             details: e.flatten(),
           });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * Packet scan enrolment — the merchant points the camera at the packet once while creating or
+   * editing the product, and the decoded barcode is stored here, so POS can later resolve the same
+   * packet with a cheap indexed lookup even when the product row carries no barcode.
+   */
+  app.post(
+    '/products/:id/scan-profile',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!hasPermission(request.authUser, 'products.edit')) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const body = z
+          .object({
+            barcode: z.string().max(128).nullable().optional(),
+            imagePhash: z.string().max(64).nullable().optional(),
+            thumbUrl: z.string().max(2048).nullable().optional(),
+            source: z.enum(['PACKET_SCAN', 'MANUAL', 'IMPORT']).optional(),
+          })
+          .parse(request.body ?? {});
+
+        const profile = await productScanService.upsertScanProfile(
+          request.authUser.shopId,
+          id,
+          request.authUser.userId,
+          body,
+        );
+        return reply.status(201).send(profile);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  app.get(
+    '/products/:id/scan-profile',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canBrowseProductsForPos(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const out = await productScanService.listScanProfiles(request.authUser.shopId, id);
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * Inventory → Barcodes: one row per product with its barcode plus shop-wide counters, so the
+   * merchant sees at a glance which products can already be scanned at the counter.
+   *
+   * Registered below `GET /products/:id`, which is fine: the router prefers a static segment over
+   * a parameter, so `/products/barcode-audit` never falls into the by-id handler.
+   */
+  app.get(
+    '/products/barcode-audit',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canUseInventoryDashboard(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const q = z
+          .object({
+            /** ALL | WITH (has a barcode) | WITHOUT (missing barcode). */
+            status: z.enum(['ALL', 'WITH', 'WITHOUT']).optional(),
+            search: z.string().optional(),
+            inventoryTracked: z
+              .enum(['true', 'false'])
+              .optional()
+              .transform((v) => (v === 'true' ? true : v === 'false' ? false : undefined)),
+            /**
+             * "Does this product have quantity?" — IN_STOCK keeps products with on-hand > 0,
+             * OUT_OF_STOCK the rest. Bundles and untracked products drop out either way, because
+             * the app has no stock figure for them.
+             */
+            stock: z.enum(['IN_STOCK', 'OUT_OF_STOCK']).optional(),
+            limit: z.coerce.number().min(1).max(200).default(DEFAULT_LIST_LIMIT),
+            offset: z.coerce.number().min(0).default(0),
+          })
+          .parse(request.query);
+
+        const out = await productService.listProductsForBarcodeAudit(
+          request.authUser.shopId,
+          q,
+        );
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  /**
+   * Fast single-product barcode set/clear — used by the barcode entry screen and the inline
+   * "add / edit barcode" affordance on the product list. Blank input clears the barcode.
+   */
+  app.patch(
+    '/products/:id/barcode',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!hasPermission(request.authUser, 'products.edit')) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const body = z
+          .object({ barcode: z.string().max(128).nullable() })
+          .parse(request.body ?? {});
+
+        const row = await productService.setProductBarcode(
+          request.authUser.shopId,
+          id,
+          body.barcode,
+        );
+        return reply.send({ id: row.id, name: row.name, sku: row.sku, barcode: row.barcode });
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
         }
         if (e instanceof AppError) return sendAppError(reply, e);
         throw e;

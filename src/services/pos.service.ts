@@ -24,29 +24,178 @@ import { generateInvoiceNo } from '../lib/invoice.js';
 import { addMoney, mulMoney, roundMoney, subMoney } from '../lib/money.js';
 import { isDeviceRegistryEnabled, isMultiStockLocationEnabled } from './shop-features.service.js';
 import { resolveLocationIdOrDefault } from './stock-location.service.js';
-import { getProductByBarcode } from './product.service.js';
+import { getProductByBarcode, getProductById } from './product.service.js';
+import { findProductIdsByBarcode } from './product-scan.service.js';
 import { searchImei } from './device.service.js';
 import { assertPaymentMethodsForCheckout } from './shop-payment-method.service.js';
 
-export async function resolveScan(shopId: string, raw: string) {
+/**
+ * Does this look like a code printed on a retail packet (EAN-8 / UPC-A / EAN-13 / ITF-14 …)?
+ *
+ * Used to keep the device search away from packet barcodes: an IMEI/serial lookup is a *substring*
+ * search on 8–15 digit identifiers, so a short numeric packet code could otherwise "find" a phone
+ * whose serial merely contained it.
+ */
+export function looksLikeRetailBarcode(value: string): boolean {
+  const digits = value.replace(/[\s-]/g, '');
+  if (!/^\d+$/.test(digits)) return false;
+  return (
+    digits.length === 8 || digits.length === 12 || digits.length === 13 || digits.length === 14
+  );
+}
+
+/**
+ * Attach on-hand stock to a resolved product.
+ *
+ * `/pos/resolve*` used to answer with the bare `products` row, and that table has **no stock column**
+ * — balances live in `inventory_balances`. The till read the missing field as `0`, so a barcode scan
+ * of a product that was sitting on the shelf still produced "catalog shows 0 on hand" and blocked
+ * checkout, while the same product picked from the grid (whose `/products` row *does* carry a
+ * balance) sold fine. Every product answer therefore carries the real quantity for the location the
+ * sale is being made from, plus that location id so the client can keep its own checks in step.
+ *
+ * `quantityOnHand` is `null` for a product that is not inventory-tracked at all (a service line):
+ * "0" would be a number nobody measured, and 0 is exactly what must never be invented here.
+ */
+async function withOnHandStock<T extends { id: string; inventoryTracked?: boolean }>(
+  shopId: string,
+  product: T,
+  requestedLocationId?: string | null,
+): Promise<T & { quantityOnHand: string | null; stockLocationId: string }> {
+  const multiLoc = await isMultiStockLocationEnabled(shopId);
+  let locationId: string;
+  try {
+    locationId = await resolveLocationIdOrDefault(shopId, requestedLocationId ?? null, multiLoc);
+  } catch {
+    // A stale location cached on a device must not break a scan: fall back to the shop default.
+    locationId = await resolveLocationIdOrDefault(shopId, null, multiLoc);
+  }
+  if (product.inventoryTracked === false) {
+    return { ...product, quantityOnHand: null, stockLocationId: locationId };
+  }
+  const [balance] = await db
+    .select({ quantity: inventoryBalances.quantity })
+    .from(inventoryBalances)
+    .where(
+      and(
+        eq(inventoryBalances.shopId, shopId),
+        eq(inventoryBalances.productId, product.id),
+        eq(inventoryBalances.locationId, locationId),
+      ),
+    )
+    .limit(1);
+  return {
+    ...product,
+    quantityOnHand: String(balance?.quantity ?? '0'),
+    stockLocationId: locationId,
+  };
+}
+
+/**
+ * Resolve whatever the cashier scanned or typed.
+ *
+ * Order matters, and it used to be wrong: the fuzzy IMEI search ran FIRST, so a scanned packet code
+ * could resolve to an arbitrary device unit before the product barcode table was ever consulted.
+ * Now an exact identifier always wins, and the device search only runs for codes that cannot be a
+ * retail barcode — and then only on an exact serial/IMEI hit first.
+ *
+ * A product answer carries its on-hand at `requestedLocationId` (or the shop default), because the
+ * till gates checkout on that number.
+ */
+export async function resolveScan(
+  shopId: string,
+  raw: string,
+  requestedLocationId?: string | null,
+) {
   const trimmed = raw.trim();
   if (!trimmed) return { type: 'empty' as const };
 
-  if (await isDeviceRegistryEnabled(shopId)) {
-    const imeiHits = await searchImei(shopId, trimmed);
-    if (imeiHits.length === 1) {
-      return { type: 'imei' as const, ...imeiHits[0]! };
-    }
-    if (imeiHits.length > 1) {
-      return { type: 'imei_ambiguous' as const, matches: imeiHits };
+  // 1) The barcode on the product row: the printed code is the strongest identity there is.
+  const byBarcode = await getProductByBarcode(shopId, trimmed);
+  if (byBarcode) {
+    return {
+      type: 'product' as const,
+      product: await withOnHandStock(shopId, byBarcode, requestedLocationId),
+    };
+  }
+
+  // 2) A packet enrolled from the camera may carry a barcode the product row does not.
+  const enrolled = await findProductIdsByBarcode(shopId, [trimmed]);
+  const enrolledId = enrolled[0]?.productId;
+  if (enrolledId) {
+    const enrolledProduct = await getProductById(shopId, enrolledId);
+    if (enrolledProduct?.active) {
+      return {
+        type: 'product' as const,
+        product: await withOnHandStock(shopId, enrolledProduct, requestedLocationId),
+      };
     }
   }
 
-  const byBarcode = await getProductByBarcode(shopId, trimmed);
-  if (byBarcode) return { type: 'product' as const, product: byBarcode };
+  // 3) Only now the device registry: exact serial/IMEI first, fuzzy only for non-barcode input.
+  if (await isDeviceRegistryEnabled(shopId)) {
+    const exactHits = await searchImei(shopId, trimmed, { exact: true });
+    if (exactHits.length === 1) return { type: 'imei' as const, ...exactHits[0]! };
+    if (exactHits.length > 1) {
+      return { type: 'imei_ambiguous' as const, matches: exactHits };
+    }
+
+    if (!looksLikeRetailBarcode(trimmed)) {
+      const imeiHits = await searchImei(shopId, trimmed);
+      if (imeiHits.length === 1) return { type: 'imei' as const, ...imeiHits[0]! };
+      if (imeiHits.length > 1) {
+        return { type: 'imei_ambiguous' as const, matches: imeiHits };
+      }
+    }
+  }
 
   return { type: 'not_found' as const };
 }
+
+/**
+ * Camera packet scan at POS.
+ *
+ * The client sends the barcode it decoded on the device (`barcode`). The server does NO recognition
+ * — it only looks up an already-enrolled packet: an exact barcode resolves to a definitive product,
+ * which the client may add straight to the cart. Anything else is reported as not found so the
+ * cashier is told what happened instead of the till silently doing nothing.
+ */
+export async function resolveScanPayload(
+  shopId: string,
+  input: { barcode?: string | null; locationId?: string | null },
+) {
+  const barcode = (input.barcode ?? '').trim();
+  if (!barcode) return { type: 'empty' as const };
+
+  const product = await getProductByBarcode(shopId, barcode);
+  if (product) {
+    return {
+      type: 'product' as const,
+      matchedBy: 'barcode' as const,
+      product: await withOnHandStock(shopId, product, input.locationId),
+    };
+  }
+
+  /*
+   * The barcode may live only on the enrolled packet (bulk import, bundle editor, or a shop that
+   * re-captured a packet after changing the printed code). One indexed lookup, no scanning.
+   */
+  const enrolled = await findProductIdsByBarcode(shopId, [barcode]);
+  const enrolledId = enrolled[0]?.productId;
+  if (enrolledId) {
+    const enrolledProduct = await getProductById(shopId, enrolledId);
+    if (enrolledProduct?.active) {
+      return {
+        type: 'product' as const,
+        matchedBy: 'profile_barcode' as const,
+        product: await withOnHandStock(shopId, enrolledProduct, input.locationId),
+      };
+    }
+  }
+
+  return { type: 'not_found' as const };
+}
+
 
 export async function createHold(
   shopId: string,

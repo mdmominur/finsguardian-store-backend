@@ -11,13 +11,46 @@ import {
 import { saleLines, sales, stockLocations } from '../db/schema/index.js';
 import { getDefaultLocationId } from './stock-location.service.js';
 
-export async function searchImei(shopId: string, rawQuery: string) {
+/**
+ * Find device units by IMEI / serial.
+ *
+ * `opts.exact` is what the POS scan uses: a camera-decoded code must identify a unit *by itself*.
+ * The fuzzy `%…%` search is for the hand-typed IMEI box, where a merchant types the last digits —
+ * used on a scanned retail barcode it matched any unit whose serial merely *contained* the code
+ * (serial `pre000101su` for a scanned `000101`), so POS added a phone that was never on the packet.
+ */
+export async function searchImei(
+  shopId: string,
+  rawQuery: string,
+  opts?: { exact?: boolean },
+) {
   const raw = rawQuery.trim();
   if (raw.length < 2) return [];
 
   const normalized = normalizeImei(raw);
-  const pat = `%${raw}%`;
-  const patNorm = `%${normalized}%`;
+  /*
+   * `ilike` without wildcards is a case-insensitive equality test.
+   * The digits-only variant covers scanners that keep spaces/dashes in the code.
+   */
+  const exactTerms = [
+    ilike(deviceUnits.imei1, raw),
+    ilike(deviceUnits.imei2, raw),
+    ilike(deviceUnits.serial, raw),
+    ilike(deviceUnits.uniqueIdentifier, raw),
+    normalized.length >= 6 ? ilike(deviceUnits.imei1, normalized) : undefined,
+    normalized.length >= 6 ? ilike(deviceUnits.imei2, normalized) : undefined,
+  ];
+  const fuzzyTerms = [
+    ilike(deviceUnits.imei1, `%${normalized}%`),
+    ilike(deviceUnits.imei2, `%${normalized}%`),
+    ilike(deviceUnits.imei1, `%${raw}%`),
+    ilike(deviceUnits.imei2, `%${raw}%`),
+    ilike(deviceUnits.serial, `%${raw}%`),
+    ilike(deviceUnits.uniqueIdentifier, `%${raw}%`),
+  ];
+  const terms = (opts?.exact ? exactTerms : fuzzyTerms).filter(
+    (c): c is NonNullable<typeof c> => c !== undefined,
+  );
 
   return db
     .select({
@@ -34,19 +67,7 @@ export async function searchImei(shopId: string, rawQuery: string) {
     .leftJoin(stockLocations, eq(stockLocations.id, deviceUnits.stockLocationId))
     .leftJoin(saleLines, eq(saleLines.id, deviceUnits.soldSaleLineId))
     .leftJoin(sales, eq(sales.id, saleLines.saleId))
-    .where(
-      and(
-        eq(deviceUnits.shopId, shopId),
-        or(
-          ilike(deviceUnits.imei1, patNorm),
-          ilike(deviceUnits.imei2, patNorm),
-          ilike(deviceUnits.imei1, pat),
-          ilike(deviceUnits.imei2, pat),
-          ilike(deviceUnits.serial, pat),
-          ilike(deviceUnits.uniqueIdentifier, pat),
-        )!,
-      ),
-    )
+    .where(and(eq(deviceUnits.shopId, shopId), or(...terms)!))
     .limit(50);
 }
 

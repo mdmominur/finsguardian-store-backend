@@ -5,6 +5,7 @@ import { canManageWebsite } from '../../lib/permissions.js';
 import * as websiteService from '../../services/shop-website.service.js';
 import * as websiteAssets from '../../services/shop-website-assets.service.js';
 import * as publicWebsite from '../../services/public-website.service.js';
+import * as websiteReviews from '../../services/website-reviews.service.js';
 
 const sliderItemSchema = z.object({
   id: z.string().min(6),
@@ -13,6 +14,62 @@ const sliderItemSchema = z.object({
   altText: z.string().nullable().optional(),
   sortOrder: z.number().int(),
   isActive: z.boolean(),
+});
+
+const bentoPromoSchema = z.object({
+  id: z.string().min(1),
+  badge: z.string(),
+  title: z.string().min(1),
+  subtitle: z.string(),
+  ctaLabel: z.string(),
+  href: z.string().min(1),
+  theme: z.enum(['dark', 'amber', 'emerald']),
+});
+
+const trustBadgeSchema = z.object({
+  title: z.string().min(1),
+  subtitle: z.string(),
+});
+
+const spotlightSchema = z.object({
+  enabled: z.boolean(),
+  badge: z.string().nullable().optional(),
+  title: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  offerBadge: z.string().nullable().optional(),
+  ctaLabel: z.string().nullable().optional(),
+  ctaHref: z.string().nullable().optional(),
+  endsAt: z.string().nullable().optional(),
+  highlights: z.array(z.string()).optional(),
+});
+
+const brandStandardSchema = z.object({
+  enabled: z.boolean(),
+  badge: z.string().nullable().optional(),
+  title: z.string().nullable().optional(),
+  subtitle: z.string().nullable().optional(),
+  pillars: z.array(
+    z.object({
+      title: z.string().min(1),
+      description: z.string(),
+    }),
+  ),
+});
+
+const faqItemSchema = z.object({
+  id: z.string().min(1),
+  question: z.string().min(1),
+  answer: z.string().min(1),
+  sortOrder: z.number().int(),
+  isActive: z.boolean(),
+});
+
+const heroEditorialSchema = z.object({
+  badgeText: z.string().nullable().optional(),
+  title: z.string().nullable().optional(),
+  subtitle: z.string().nullable().optional(),
+  primaryCtaLabel: z.string().nullable().optional(),
+  primaryCtaHref: z.string().nullable().optional(),
 });
 
 const patchWebsiteBody = z
@@ -40,6 +97,8 @@ const patchWebsiteBody = z
         supportEmail: z.string().nullable().optional(),
         supportPhone: z.string().nullable().optional(),
         facebookUrl: z.string().nullable().optional(),
+        whatsappPhone: z.string().nullable().optional(),
+        supportHours: z.string().nullable().optional(),
       })
       .optional(),
     checkout: z
@@ -57,6 +116,8 @@ const patchWebsiteBody = z
       .object({
         showCategoryMenu: z.boolean().optional(),
         menuCategoryIds: z.array(z.string().uuid()).optional(),
+        announcementEnabled: z.boolean().optional(),
+        announcementText: z.string().nullable().optional(),
       })
       .optional(),
     footer: z
@@ -70,6 +131,12 @@ const patchWebsiteBody = z
       .object({
         sliderEnabled: z.boolean().optional(),
         sliderItems: z.array(sliderItemSchema).optional(),
+        heroEditorial: heroEditorialSchema.optional(),
+        bentoPromos: z.array(bentoPromoSchema).optional(),
+        trustBadges: z.array(trustBadgeSchema).optional(),
+        spotlight: spotlightSchema.optional(),
+        brandStandard: brandStandardSchema.optional(),
+        faqs: z.array(faqItemSchema).optional(),
       })
       .optional(),
   })
@@ -110,7 +177,7 @@ export async function registerShopWebsiteRoutes(app: FastifyInstance) {
           return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website permission required' });
         }
         const body = patchWebsiteBody.parse(request.body);
-        const out = await websiteService.patchShopWebsiteSettings(request.authUser.shopId, body);
+        const out = await websiteService.patchShopWebsiteSettings(request.authUser.shopId, body as any);
         return reply.send(out);
       } catch (e) {
         if (e instanceof z.ZodError) {
@@ -188,7 +255,7 @@ export async function registerShopWebsiteRoutes(app: FastifyInstance) {
       if (!out) {
         return reply.status(404).send({ code: 'SITE_DISABLED', message: 'Website is not published' });
       }
-      reply.header('Cache-Control', 'public, max-age=60');
+      reply.header('Cache-Control', 'public, max-age=30');
       return reply.send(out);
     } catch (e) {
       if (e instanceof AppError) return sendAppError(reply, e);
@@ -245,7 +312,7 @@ export async function registerShopWebsiteRoutes(app: FastifyInstance) {
       .parse(request.params);
     try {
       const out = await publicWebsite.getPublicProductBySlug(slug, productSlug);
-      reply.header('Cache-Control', 'public, max-age=120');
+      reply.header('Cache-Control', 'public, max-age=60');
       return reply.send(out);
     } catch (e) {
       if (e instanceof AppError) return sendAppError(reply, e);
@@ -259,7 +326,33 @@ export async function registerShopWebsiteRoutes(app: FastifyInstance) {
       .parse(request.params);
     try {
       const out = await publicWebsite.getPublicProductById(slug, productId);
-      reply.header('Cache-Control', 'public, max-age=120');
+      reply.header('Cache-Control', 'public, max-age=60');
+      return reply.send(out);
+    } catch (e) {
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
+
+  app.get('/public/shops/:slug/products/:productId/reviews', async (request, reply) => {
+    const { slug, productId } = z
+      .object({ slug: z.string().min(1), productId: z.string().uuid() })
+      .parse(request.params);
+    try {
+      const out = await websiteReviews.listPublicProductReviews(slug, productId);
+      reply.header('Cache-Control', 'public, max-age=30');
+      return reply.send(out);
+    } catch (e) {
+      if (e instanceof AppError) return sendAppError(reply, e);
+      throw e;
+    }
+  });
+
+  app.get('/public/shops/:slug/testimonials', async (request, reply) => {
+    const { slug } = z.object({ slug: z.string().min(1) }).parse(request.params);
+    try {
+      const out = await websiteReviews.listPublicFeaturedTestimonials(slug, 6);
+      reply.header('Cache-Control', 'public, max-age=60');
       return reply.send(out);
     } catch (e) {
       if (e instanceof AppError) return sendAppError(reply, e);

@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import { env } from './config/env.js';
+import { isUniqueViolation, uniqueViolationMessage } from './lib/db-errors.js';
 import { AppError, sendAppError } from './lib/errors.js';
 import jwtAuth from './plugins/jwt-auth.js';
 import { registerInternalV1Routes } from './routes/internal/v1/register.js';
@@ -48,6 +49,21 @@ export async function buildApp() {
   app.setErrorHandler((err, request, reply) => {
     if (err instanceof AppError) {
       return sendAppError(reply, err);
+    }
+    // Postgres unique violation (duplicate barcode / SKU / phone / code …). Without this mapping the
+    // merchant saw a 500 "Internal error" for what is a plain conflict — and, in dev, the raw
+    // `duplicate key value violates unique constraint "ux_products_shop_barcode"` text. The service
+    // layers pre-check the friendly cases; this is the safety net for races and other unique cols.
+    if (isUniqueViolation(err)) {
+      request.log.warn({ err }, 'unique violation');
+      return reply.status(409).send({
+        code: 'CONFLICT',
+        message: uniqueViolationMessage(
+          err && typeof err === 'object' && 'constraint' in err
+            ? (err as { constraint?: string }).constraint
+            : undefined,
+        ),
+      });
     }
     request.log.error(err);
     const status =

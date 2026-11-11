@@ -5,6 +5,7 @@ import { canManageWebsite, canViewWebOrderInvoices } from '../../lib/permissions
 import * as websiteProducts from '../../services/website-products.service.js';
 import * as storefrontFulfillment from '../../services/storefront-fulfillment.service.js';
 import * as websiteAssets from '../../services/shop-website-assets.service.js';
+import * as websiteReviews from '../../services/website-reviews.service.js';
 import { and, eq, ne } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { productWebsiteImages, productWebsiteProfiles, products } from '../../db/schema/index.js';
@@ -165,7 +166,6 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
     '/website/products/:productId/images',
     {
       preHandler: [app.authenticate],
-      // base64 JSON payload is larger than the actual image bytes (~33% overhead)
       bodyLimit: 16 * 1024 * 1024,
     },
     async (request, reply) => {
@@ -190,7 +190,6 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
           .limit(1);
         if (!p) throw AppError.notFound('Product not found');
 
-        // If replacing cover, deactivate previous cover rows and delete their files.
         if (body.kind === 'cover') {
           const existing = await db
             .select({ id: productWebsiteImages.id, url: productWebsiteImages.url })
@@ -241,7 +240,6 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
           dataUrl: body.dataUrl,
         });
 
-        // For cover, set sort_order=0; for gallery append at end by using createdAt ordering.
         await db.insert(productWebsiteImages).values({
           shopId: request.authUser.shopId,
           productId,
@@ -253,7 +251,6 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
           updatedAt: new Date(),
         });
 
-        // Set OG + Twitter image from cover upload.
         if (body.kind === 'cover') {
           await db
             .insert(productWebsiteProfiles)
@@ -342,6 +339,8 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
     },
   );
 
+  // ─── Staff Website Fulfillment Orders ─────────────────────────────────────
+
   app.get(
     '/website/storefront-fulfillment-orders',
     { preHandler: [app.authenticate] },
@@ -358,6 +357,30 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
         const out = await storefrontFulfillment.listStaffFulfillmentOrders({
           shopId: request.authUser.shopId,
           status: q.status,
+        });
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  app.get(
+    '/website/storefront-fulfillment-orders/:id',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canViewWebOrderInvoices(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website orders permission required' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const out = await storefrontFulfillment.getStaffFulfillmentOrderDetail({
+          shopId: request.authUser.shopId,
+          orderId: id,
         });
         return reply.send(out);
       } catch (e) {
@@ -418,5 +441,114 @@ export async function registerWebsiteRoutes(app: FastifyInstance) {
       }
     },
   );
-}
 
+  app.post(
+    '/website/storefront-fulfillment-orders/:id/cancel',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canViewWebOrderInvoices(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website orders permission required' });
+        }
+        const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+        const body = z
+          .object({
+            reason: z.string().nullable().optional(),
+          })
+          .parse(request.body ?? {});
+        const out = await storefrontFulfillment.cancelStorefrontFulfillmentOrder({
+          shopId: request.authUser.shopId,
+          orderId: id,
+          reason: body.reason,
+        });
+        return reply.status(200).send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  // ─── Staff Product Reviews Moderation ─────────────────────────────────────
+
+  app.get(
+    '/website/reviews',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canManageWebsite(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website permission required' });
+        }
+        const q = z
+          .object({
+            status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional(),
+            search: z.string().optional(),
+            limit: z.coerce.number().min(1).max(200).default(50),
+            offset: z.coerce.number().min(0).default(0),
+          })
+          .parse(request.query ?? {});
+        const out = await websiteReviews.listStaffProductReviews(request.authUser.shopId, q);
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  app.patch(
+    '/website/reviews/:reviewId',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canManageWebsite(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website permission required' });
+        }
+        const { reviewId } = z.object({ reviewId: z.string().uuid() }).parse(request.params);
+        const body = z
+          .object({
+            status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional(),
+            isFeaturedOnHome: z.boolean().optional(),
+            merchantReply: z.string().nullable().optional(),
+          })
+          .strict()
+          .parse(request.body);
+        const out = await websiteReviews.patchStaffProductReview(request.authUser.shopId, reviewId, body);
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
+  app.delete(
+    '/website/reviews/:reviewId',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!canManageWebsite(request.authUser)) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Website permission required' });
+        }
+        const { reviewId } = z.object({ reviewId: z.string().uuid() }).parse(request.params);
+        const out = await websiteReviews.deleteStaffProductReview(request.authUser.shopId, reviewId);
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+}

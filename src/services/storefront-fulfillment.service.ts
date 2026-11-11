@@ -1,10 +1,13 @@
 import { randomBytes } from 'node:crypto';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   customerAddresses,
   customers,
   deliveryLocations,
+  deviceUnits,
+  inventoryBalances,
+  productWebsiteImages,
   productWebsiteProfiles,
   products,
   sales,
@@ -39,10 +42,12 @@ export async function placeStorefrontFulfillmentOrder(input: {
   shopSlug: string;
   shopId: string;
   customerId: string;
-  /** Optional: saved address book row. If omitted, customer profile `customers.address` must be set. */
   shippingAddressId?: string | null;
-  /** Optional storefront-selected delivery location. */
   deliveryLocationId?: string | null;
+  recipientName?: string | null;
+  recipientPhone?: string | null;
+  shippingAddressText?: string | null;
+  customerNote?: string | null;
   lines: { productId: string; qty: number }[];
   idempotencyKey?: string | null;
 }) {
@@ -66,13 +71,21 @@ export async function placeStorefrontFulfillmentOrder(input: {
   if (!custRow) throw AppError.badRequest('Customer not found');
 
   let resolvedShippingAddressId: string | null = null;
-  let resolvedShippingAddressString: string | null = null;
+  let resolvedShippingAddressString: string | null = input.shippingAddressText?.trim() || null;
   let resolvedDeliveryLocationId: string | null = null;
   let resolvedDeliveryCharge = '0';
 
   if (shipId) {
     const [addr] = await db
-      .select({ id: customerAddresses.id, address: customerAddresses.line1 })
+      .select({
+        id: customerAddresses.id,
+        line1: customerAddresses.line1,
+        line2: customerAddresses.line2,
+        city: customerAddresses.city,
+        postalCode: customerAddresses.postalCode,
+        recipientName: customerAddresses.recipientName,
+        phone: customerAddresses.phone,
+      })
       .from(customerAddresses)
       .where(
         and(
@@ -84,10 +97,21 @@ export async function placeStorefrontFulfillmentOrder(input: {
       .limit(1);
     if (!addr) throw AppError.badRequest('Delivery address not found');
     resolvedShippingAddressId = addr.id;
-    resolvedShippingAddressString = addr.address;
+    if (!resolvedShippingAddressString) {
+      resolvedShippingAddressString = [addr.line1, addr.line2, addr.city, addr.postalCode]
+        .filter(Boolean)
+        .join(', ');
+    }
   }
-  // No saved address id: storefront does not collect address right now — optional `customers.address`
-  // in DB remains for future use; fulfillment row ships with null shipping_address_id.
+
+  if (!resolvedShippingAddressString && custRow.address) {
+    resolvedShippingAddressString = custRow.address;
+  }
+
+  const resolvedRecipientName = input.recipientName?.trim() || custRow.name || null;
+  const resolvedRecipientPhone = input.recipientPhone?.trim() || custRow.phone || null;
+  const resolvedCustomerNote = input.customerNote?.trim() || null;
+
   if (deliveryLocId) {
     const [loc] = await db
       .select({ id: deliveryLocations.id, deliveryCharge: deliveryLocations.deliveryCharge })
@@ -175,6 +199,10 @@ export async function placeStorefrontFulfillmentOrder(input: {
         shippingAddressId: resolvedShippingAddressId,
         deliveryLocationId: resolvedDeliveryLocationId,
         deliveryCharge: resolvedDeliveryCharge,
+        recipientName: resolvedRecipientName,
+        recipientPhone: resolvedRecipientPhone,
+        shippingAddressText: resolvedShippingAddressString,
+        customerNote: resolvedCustomerNote,
         status: 'PROCESSING',
         publicRef,
         idempotencyKey: idem,
@@ -199,7 +227,7 @@ export async function placeStorefrontFulfillmentOrder(input: {
 
   if (isMailConfigured(shop.settings)) {
     const emailItems = resolvedLines.map((rl) => ({
-      name: (rl as any).name || 'Product',
+      name: rl.name || 'Product',
       qty: Number(rl.qty),
       total: mulMoney(rl.qty, rl.unitPrice),
     }));
@@ -222,22 +250,20 @@ export async function placeStorefrontFulfillmentOrder(input: {
       total: grandTotal,
       items: emailItems,
       customer: {
-        name: custRow.name,
+        name: resolvedRecipientName || custRow.name,
         email: custRow.email,
-        phone: custRow.phone,
+        phone: resolvedRecipientPhone || custRow.phone,
         address: resolvedShippingAddressString || custRow.address,
       },
       shopSettings: shop.settings,
     };
 
-    // Send to customer
     if (custRow.email) {
       sendOrderConfirmationEmail({ ...emailOpts, to: custRow.email }).catch((err) =>
         console.error('[storefront-fulfillment] Failed to send customer order email:', err),
       );
     }
 
-    // Send to shop owner
     db.select({ email: users.email })
       .from(shopUsers)
       .innerJoin(users, eq(users.id, shopUsers.userId))
@@ -259,7 +285,6 @@ export async function attachSaleToFulfillmentOrder(input: {
   shopId: string;
   fulfillmentOrderId: string;
   saleId: string;
-  /** Optional: ensure sale belongs to this customer when set */
   expectedCustomerId?: string | null;
 }) {
   const [fo] = await db
@@ -323,6 +348,36 @@ export async function markStorefrontFulfillmentShipped(input: { shopId: string; 
   return { ok: true as const, publicRef: fo.publicRef };
 }
 
+/** Cancel a PROCESSING website order before POS fulfillment. */
+export async function cancelStorefrontFulfillmentOrder(input: {
+  shopId: string;
+  orderId: string;
+  reason?: string | null;
+}) {
+  const [fo] = await db
+    .select()
+    .from(storefrontFulfillmentOrders)
+    .where(
+      and(eq(storefrontFulfillmentOrders.id, input.orderId), eq(storefrontFulfillmentOrders.shopId, input.shopId)),
+    )
+    .limit(1);
+  if (!fo) throw AppError.notFound('Order not found');
+  if (fo.status !== 'PROCESSING') {
+    throw AppError.conflict('Only processing orders can be cancelled directly before POS checkout');
+  }
+
+  await db
+    .update(storefrontFulfillmentOrders)
+    .set({
+      status: 'CANCELLED',
+      cancelledReason: input.reason?.trim() || 'Cancelled by staff before checkout',
+      cancelledAt: new Date(),
+    })
+    .where(eq(storefrontFulfillmentOrders.id, fo.id));
+
+  return { ok: true as const, publicRef: fo.publicRef };
+}
+
 export async function listStaffFulfillmentOrders(input: {
   shopId: string;
   status?: 'PROCESSING' | 'OUT_FOR_DELIVERY' | 'SHIPPED' | 'CANCELLED';
@@ -335,13 +390,21 @@ export async function listStaffFulfillmentOrders(input: {
       status: storefrontFulfillmentOrders.status,
       createdAt: storefrontFulfillmentOrders.createdAt,
       customerId: storefrontFulfillmentOrders.customerId,
-        deliveryLocationId: storefrontFulfillmentOrders.deliveryLocationId,
-        deliveryCharge: storefrontFulfillmentOrders.deliveryCharge,
+      deliveryLocationId: storefrontFulfillmentOrders.deliveryLocationId,
+      deliveryLocationName: deliveryLocations.name,
+      deliveryCharge: storefrontFulfillmentOrders.deliveryCharge,
+      recipientName: storefrontFulfillmentOrders.recipientName,
+      recipientPhone: storefrontFulfillmentOrders.recipientPhone,
+      shippingAddressText: storefrontFulfillmentOrders.shippingAddressText,
+      customerNote: storefrontFulfillmentOrders.customerNote,
+      cancelledReason: storefrontFulfillmentOrders.cancelledReason,
+      cancelledAt: storefrontFulfillmentOrders.cancelledAt,
       saleId: storefrontFulfillmentOrders.saleId,
       saleInvoiceNo: sales.invoiceNo,
     })
     .from(storefrontFulfillmentOrders)
     .leftJoin(sales, eq(sales.id, storefrontFulfillmentOrders.saleId))
+    .leftJoin(deliveryLocations, eq(deliveryLocations.id, storefrontFulfillmentOrders.deliveryLocationId))
     .where(and(eq(storefrontFulfillmentOrders.shopId, input.shopId), eq(storefrontFulfillmentOrders.status, st)))
     .orderBy(desc(storefrontFulfillmentOrders.createdAt))
     .limit(100);
@@ -350,41 +413,225 @@ export async function listStaffFulfillmentOrders(input: {
   const custRows =
     customerIds.length > 0
       ? await db
-          .select({ id: customers.id, name: customers.name, phone: customers.phone })
+          .select({
+            id: customers.id,
+            name: customers.name,
+            phone: customers.phone,
+            email: customers.email,
+            address: customers.address,
+          })
           .from(customers)
           .where(and(eq(customers.shopId, input.shopId), inArray(customers.id, customerIds)))
       : [];
 
   const custMap = new Map(custRows.map((c) => [c.id, c]));
 
+  const orderIds = rows.map((r) => r.id);
+  const allLines =
+    orderIds.length > 0
+      ? await db
+          .select({
+            id: storefrontFulfillmentOrderLines.id,
+            orderId: storefrontFulfillmentOrderLines.orderId,
+            productId: storefrontFulfillmentOrderLines.productId,
+            productName: products.name,
+            sku: products.sku,
+            qty: storefrontFulfillmentOrderLines.qty,
+            unitPrice: storefrontFulfillmentOrderLines.unitPrice,
+            coverImageUrl: sql<string | null>`(select url from ${productWebsiteImages} i where i.shop_id = ${products.shopId} and i.product_id = ${products.id} and i.kind = 'COVER' and i.is_active = true order by i.sort_order asc, i.created_at desc limit 1)`,
+          })
+          .from(storefrontFulfillmentOrderLines)
+          .innerJoin(products, eq(products.id, storefrontFulfillmentOrderLines.productId))
+          .where(inArray(storefrontFulfillmentOrderLines.orderId, orderIds))
+      : [];
+
+  const linesByOrder = new Map<string, typeof allLines>();
+  for (const ln of allLines) {
+    const arr = linesByOrder.get(ln.orderId) ?? [];
+    arr.push(ln);
+    linesByOrder.set(ln.orderId, arr);
+  }
+
   const out = [];
   for (const r of rows) {
-    const lineRows = await db
-      .select({
-        productId: storefrontFulfillmentOrderLines.productId,
-        qty: storefrontFulfillmentOrderLines.qty,
-        unitPrice: storefrontFulfillmentOrderLines.unitPrice,
-      })
-      .from(storefrontFulfillmentOrderLines)
-      .where(eq(storefrontFulfillmentOrderLines.orderId, r.id));
+    const lineRows = linesByOrder.get(r.id) ?? [];
 
     let subtotal = '0';
-    for (const ln of lineRows) {
-      subtotal = addMoney(subtotal, mulMoney(ln.qty, ln.unitPrice));
-    }
+    const lines = lineRows.map((ln) => {
+      const lineTotal = mulMoney(ln.qty, ln.unitPrice);
+      subtotal = addMoney(subtotal, lineTotal);
+      return {
+        id: ln.id,
+        productId: ln.productId,
+        productName: ln.productName,
+        sku: ln.sku,
+        qty: ln.qty,
+        unitPrice: ln.unitPrice,
+        lineTotal,
+        coverImageUrl: ln.coverImageUrl,
+      };
+    });
 
     const c = custMap.get(r.customerId);
     out.push({
       ...r,
-      customerName: c?.name ?? null,
-      customerPhone: c?.phone ?? null,
+      customerName: r.recipientName || c?.name || null,
+      customerPhone: r.recipientPhone || c?.phone || null,
+      customerEmail: c?.email ?? null,
+      shippingAddress: r.shippingAddressText || c?.address || null,
       lineCount: lineRows.length,
+      lines,
       subtotal,
       total: addMoney(subtotal, r.deliveryCharge ?? '0'),
     });
   }
 
   return { items: out };
+}
+
+/** Complete Order & Customer 360 Inspector before going to POS checkout. */
+export async function getStaffFulfillmentOrderDetail(input: { shopId: string; orderId: string }) {
+  const [fo] = await db
+    .select({
+      id: storefrontFulfillmentOrders.id,
+      publicRef: storefrontFulfillmentOrders.publicRef,
+      status: storefrontFulfillmentOrders.status,
+      createdAt: storefrontFulfillmentOrders.createdAt,
+      customerId: storefrontFulfillmentOrders.customerId,
+      shippingAddressId: storefrontFulfillmentOrders.shippingAddressId,
+      deliveryLocationId: storefrontFulfillmentOrders.deliveryLocationId,
+      deliveryLocationName: deliveryLocations.name,
+      deliveryCharge: storefrontFulfillmentOrders.deliveryCharge,
+      recipientName: storefrontFulfillmentOrders.recipientName,
+      recipientPhone: storefrontFulfillmentOrders.recipientPhone,
+      shippingAddressText: storefrontFulfillmentOrders.shippingAddressText,
+      customerNote: storefrontFulfillmentOrders.customerNote,
+      cancelledReason: storefrontFulfillmentOrders.cancelledReason,
+      cancelledAt: storefrontFulfillmentOrders.cancelledAt,
+      saleId: storefrontFulfillmentOrders.saleId,
+      saleInvoiceNo: sales.invoiceNo,
+    })
+    .from(storefrontFulfillmentOrders)
+    .leftJoin(sales, eq(sales.id, storefrontFulfillmentOrders.saleId))
+    .leftJoin(deliveryLocations, eq(deliveryLocations.id, storefrontFulfillmentOrders.deliveryLocationId))
+    .where(
+      and(eq(storefrontFulfillmentOrders.id, input.orderId), eq(storefrontFulfillmentOrders.shopId, input.shopId)),
+    )
+    .limit(1);
+
+  if (!fo) throw AppError.notFound('Fulfillment order not found');
+
+  const [cust] = await db
+    .select({
+      id: customers.id,
+      name: customers.name,
+      phone: customers.phone,
+      email: customers.email,
+      address: customers.address,
+      notes: customers.notes,
+      createdAt: customers.createdAt,
+    })
+    .from(customers)
+    .where(and(eq(customers.id, fo.customerId), eq(customers.shopId, input.shopId)))
+    .limit(1);
+
+  const savedAddresses = await db
+    .select()
+    .from(customerAddresses)
+    .where(and(eq(customerAddresses.shopId, input.shopId), eq(customerAddresses.customerId, fo.customerId)));
+
+  // Past order statistics for this customer
+  const [orderStats] = await db
+    .select({
+      totalWebOrders: sql<number>`count(*)::int`,
+      shippedOrders: sql<number>`count(*) filter (where ${storefrontFulfillmentOrders.status} = 'SHIPPED')::int`,
+      cancelledOrders: sql<number>`count(*) filter (where ${storefrontFulfillmentOrders.status} = 'CANCELLED')::int`,
+    })
+    .from(storefrontFulfillmentOrders)
+    .where(
+      and(
+        eq(storefrontFulfillmentOrders.shopId, input.shopId),
+        eq(storefrontFulfillmentOrders.customerId, fo.customerId),
+      ),
+    );
+
+  const [spendStats] = await db
+    .select({
+      totalSpent: sql<string>`coalesce(sum(${sales.total}), 0)::text`,
+    })
+    .from(sales)
+    .where(
+      and(
+        eq(sales.shopId, input.shopId),
+        eq(sales.customerId, fo.customerId),
+        eq(sales.status, 'COMPLETED'),
+      ),
+    );
+
+  const lineRows = await db
+    .select({
+      id: storefrontFulfillmentOrderLines.id,
+      productId: storefrontFulfillmentOrderLines.productId,
+      qty: storefrontFulfillmentOrderLines.qty,
+      unitPrice: storefrontFulfillmentOrderLines.unitPrice,
+      productName: products.name,
+      sku: products.sku,
+      trackingMode: products.trackingMode,
+      inventoryTracked: products.inventoryTracked,
+      coverImageUrl: sql<string | null>`(select url from ${productWebsiteImages} i where i.shop_id = ${products.shopId} and i.product_id = ${products.id} and i.kind = 'COVER' and i.is_active = true order by i.sort_order asc, i.created_at desc limit 1)`,
+      bulkStockQty: sql<string>`coalesce((select sum(b.quantity) from ${inventoryBalances} b where b.shop_id = ${products.shopId} and b.product_id = ${products.id}), 0)::text`,
+      serialStockQty: sql<string>`coalesce((select count(*) from ${deviceUnits} d where d.shop_id = ${products.shopId} and d.product_id = ${products.id} and d.status = 'IN_STOCK' and not d.blocklisted), 0)::text`,
+    })
+    .from(storefrontFulfillmentOrderLines)
+    .innerJoin(products, eq(products.id, storefrontFulfillmentOrderLines.productId))
+    .where(eq(storefrontFulfillmentOrderLines.orderId, fo.id));
+
+  let subtotal = '0';
+  const lines = lineRows.map((ln) => {
+    const lineTotal = mulMoney(ln.qty, ln.unitPrice);
+    subtotal = addMoney(subtotal, lineTotal);
+    const currentStockQty =
+      ln.trackingMode === 'SERIALIZED' ? Number(ln.serialStockQty) : Number(ln.bulkStockQty);
+    return {
+      id: ln.id,
+      productId: ln.productId,
+      productName: ln.productName,
+      sku: ln.sku,
+      trackingMode: ln.trackingMode,
+      inventoryTracked: ln.inventoryTracked !== false,
+      currentStockQty,
+      qty: ln.qty,
+      unitPrice: ln.unitPrice,
+      lineTotal,
+      coverImageUrl: ln.coverImageUrl,
+    };
+  });
+
+  const total = addMoney(subtotal, fo.deliveryCharge ?? '0');
+
+  return {
+    order: {
+      ...fo,
+      subtotal,
+      total,
+      shippingAddress: fo.shippingAddressText || cust?.address || null,
+      recipientName: fo.recipientName || cust?.name || null,
+      recipientPhone: fo.recipientPhone || cust?.phone || null,
+    },
+    customer: cust
+      ? {
+          ...cust,
+          savedAddresses,
+          stats: {
+            totalWebOrders: orderStats?.totalWebOrders ?? 1,
+            shippedOrders: orderStats?.shippedOrders ?? 0,
+            cancelledOrders: orderStats?.cancelledOrders ?? 0,
+            totalSpent: spendStats?.totalSpent ?? '0',
+          },
+        }
+      : null,
+    lines,
+  };
 }
 
 /** Build POS hold payload `{ cart, webFulfillmentOrderId, customerId }` and create hold. */

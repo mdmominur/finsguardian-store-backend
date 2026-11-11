@@ -6,6 +6,7 @@ import * as publicCustomerAddresses from '../../services/public-customer-address
 import * as publicCustomerAuth from '../../services/public-customer-auth.service.js';
 import * as publicCustomerOrders from '../../services/public-customer-orders.service.js';
 import * as publicStorefrontCheckout from '../../services/public-storefront-checkout.service.js';
+import * as websiteReviews from '../../services/website-reviews.service.js';
 
 const createAddressBody = z.object({
   label: z.string().nullable().optional(),
@@ -37,15 +38,24 @@ const patchMeBody = z.object({
 });
 
 const placeWebOrderBody = z.object({
-  /** Saved address book id (optional); storefront may omit while address UI is disabled. */
   shippingAddressId: z.string().uuid().optional(),
   deliveryLocationId: z.string().uuid().optional(),
+  recipientName: z.string().nullable().optional(),
+  recipientPhone: z.string().nullable().optional(),
+  shippingAddressText: z.string().nullable().optional(),
+  customerNote: z.string().nullable().optional(),
   lines: z.array(
     z.object({
       productId: z.string().uuid(),
       qty: z.coerce.number().positive(),
     }),
   ),
+});
+
+const createReviewBody = z.object({
+  rating: z.coerce.number().int().min(1).max(5),
+  title: z.string().max(150).nullable().optional(),
+  comment: z.string().min(3).max(2000),
 });
 
 export async function registerPublicCustomerRoutes(app: FastifyInstance) {
@@ -243,6 +253,10 @@ export async function registerPublicCustomerRoutes(app: FastifyInstance) {
           customerId: auth.customerId,
           shippingAddressId: body.shippingAddressId ?? null,
           deliveryLocationId: body.deliveryLocationId ?? null,
+          recipientName: body.recipientName ?? null,
+          recipientPhone: body.recipientPhone ?? null,
+          shippingAddressText: body.shippingAddressText ?? null,
+          customerNote: body.customerNote ?? null,
           lines: body.lines,
           idempotencyKey,
         });
@@ -295,6 +309,40 @@ export async function registerPublicCustomerRoutes(app: FastifyInstance) {
     },
   );
 
+  // Authenticated customer submits a product review
+  app.post(
+    '/public/shops/:slug/products/:productId/reviews',
+    { preHandler: authenticateCustomer },
+    async (request, reply) => {
+      try {
+        const slug = String((request.params as any).slug ?? '');
+        const { productId } = z.object({ productId: z.string().uuid() }).parse(request.params);
+        const auth = request.customerAuth!;
+        const body = createReviewBody.parse(request.body);
+        const out = await websiteReviews.createPublicProductReview({
+          shopSlug: slug,
+          shopId: auth.shopId,
+          customerId: auth.customerId,
+          productId,
+          rating: body.rating,
+          title: body.title,
+          comment: body.comment,
+        });
+        return reply.status(201).send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({
+            code: 'VALIDATION_ERROR',
+            message: 'Invalid review data',
+            details: e.flatten(),
+          });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
+    },
+  );
+
   // Get active delivery locations for checkout (public endpoint - no auth required)
   app.get(
     '/public/shops/:slug/delivery-locations',
@@ -305,7 +353,6 @@ export async function registerPublicCustomerRoutes(app: FastifyInstance) {
         const { shops, deliveryLocations } = await import('../../db/schema/index.js');
         const { eq, and } = await import('drizzle-orm');
 
-        // Find shop by slug
         const [shop] = await dbClient
           .select({ id: shops.id })
           .from(shops)
@@ -318,7 +365,6 @@ export async function registerPublicCustomerRoutes(app: FastifyInstance) {
           });
         }
 
-        // Get active delivery locations
         const locations = await dbClient
           .select()
           .from(deliveryLocations)
@@ -337,4 +383,3 @@ export async function registerPublicCustomerRoutes(app: FastifyInstance) {
     },
   );
 }
-

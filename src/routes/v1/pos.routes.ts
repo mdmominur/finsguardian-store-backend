@@ -13,9 +13,48 @@ export async function registerPosRoutes(app: FastifyInstance) {
       if (!hasPermission(request.authUser, 'pos.use')) {
         return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
       }
-      const q = z.object({ q: z.string().min(1) }).parse(request.query);
-      const out = await posService.resolveScan(request.authUser.shopId, q.q);
+      const q = z
+        .object({
+          q: z.string().min(1),
+          /** The till's location, so the product answer carries real on-hand stock. */
+          locationId: z.string().uuid().optional(),
+        })
+        .parse(request.query);
+      const out = await posService.resolveScan(request.authUser.shopId, q.q, q.locationId);
       return reply.send(out);
+    },
+  );
+
+  /**
+   * Camera packet scan (enrolment-driven lookup).
+   * Body: `{ barcode?: string, locationId?: string }` — decoded on the device, nothing is recognised
+   * server-side. Barcode → exact product (with on-hand stock); anything else → `not_found` (never a
+   * guess).
+   */
+  app.post(
+    '/pos/resolve-scan',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      try {
+        if (!hasPermission(request.authUser, 'pos.use')) {
+          return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
+        }
+        const body = z
+          .object({
+            barcode: z.string().max(128).nullable().optional(),
+            locationId: z.string().uuid().nullable().optional(),
+          })
+          .parse(request.body ?? {});
+
+        const out = await posService.resolveScanPayload(request.authUser.shopId, body);
+        return reply.send(out);
+      } catch (e) {
+        if (e instanceof z.ZodError) {
+          return reply.status(400).send({ code: 'VALIDATION_ERROR', details: e.flatten() });
+        }
+        if (e instanceof AppError) return sendAppError(reply, e);
+        throw e;
+      }
     },
   );
 

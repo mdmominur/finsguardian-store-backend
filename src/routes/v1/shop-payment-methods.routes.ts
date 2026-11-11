@@ -17,8 +17,13 @@ export async function registerShopPaymentMethodRoutes(app: FastifyInstance) {
       ) {
         return reply.status(403).send({ code: 'FORBIDDEN', message: 'Role' });
       }
-      const withBalances = (request.query as Record<string, string>).withBalances === '1';
-      if (withBalances && hasPermission(request.authUser, 'finance.pricing')) {
+      // Finance-capable users always get the computed wallet balances. A wallet
+      // rendered without its amount (client forgot `withBalances=1`, or a shared
+      // react-query cache held the plain POS list) looks like a missing balance
+      // to the shop owner, so the permission — not the query flag — decides.
+      // POS / cashiers without finance access keep the lightweight id+name list
+      // they need for the checkout dropdown.
+      if (hasPermission(request.authUser, 'finance.pricing')) {
         const items = await shopPaymentMethodService.listPaymentMethodsWithBalances(request.authUser.shopId);
         return reply.send({ items });
       }

@@ -4,5 +4,6 @@ dist/
 .env.local
 *.log
 .drizzle/
+.tessdata/
 storage/shop-website-assets/**
 !storage/shop-website-assets/.gitkeep

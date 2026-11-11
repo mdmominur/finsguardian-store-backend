@@ -11,6 +11,7 @@ import {
   deviceUnits,
   productBatches,
   products,
+  productScanProfiles,
   productWebsiteProfiles,
   purchaseOrderLines,
   purchaseOrders,
@@ -18,6 +19,7 @@ import {
   suppliers,
   uoms,
 } from '../db/schema/index.js';
+import { isUniqueViolation } from '../lib/db-errors.js';
 import { AppError } from '../lib/errors.js';
 import { getOrComputeShopCache } from '../lib/shop-cache.js';
 import { isMultiStockLocationEnabled } from './shop-features.service.js';
@@ -745,6 +747,78 @@ function generateBarcode(): string {
   return `8${barcodeSuffix()}`;
 }
 
+/**
+ * Trim a merchant-entered barcode. Blank means "no barcode" — exactly the predicate of the partial
+ * unique index `ux_products_shop_barcode`, so empty strings never collide.
+ */
+export function normaliseBarcode(raw: string | null | undefined): string | null {
+  const trimmed = (raw ?? '').trim();
+  return trimmed ? trimmed : null;
+}
+
+/**
+ * Reject a barcode that another product in the same shop already owns, or that is enrolled as a
+ * packet for another product (POS resolves enrolled packet codes too, so a shared code would scan
+ * as the wrong item at the till).
+ *
+ * `ux_products_shop_barcode` / `ux_psp_shop_barcode` remain the real guards — they are what makes
+ * concurrent saves safe — but a raw 23505 reaches the merchant as a 500 "duplicate key value
+ * violates unique constraint", which tells them nothing. Every barcode write path (create, full
+ * edit, inline barcode edit) runs this first so the message names the product holding the code.
+ *
+ * Returns the normalised value to store (`null` when the input is blank).
+ */
+export async function assertBarcodeAvailable(
+  shopId: string,
+  rawBarcode: string | null | undefined,
+  excludeProductId?: string,
+): Promise<string | null> {
+  const barcode = normaliseBarcode(rawBarcode);
+  if (!barcode) return null;
+  if (barcode.length > BARCODE_MAX_LENGTH) {
+    throw AppError.badRequest(`Barcode is too long (max ${BARCODE_MAX_LENGTH} characters)`);
+  }
+
+  const [productClash] = await db
+    .select({ name: products.name, sku: products.sku })
+    .from(products)
+    .where(
+      and(
+        eq(products.shopId, shopId),
+        eq(products.barcode, barcode),
+        ...(excludeProductId ? [ne(products.id, excludeProductId)] : []),
+      ),
+    )
+    .limit(1);
+  if (productClash) {
+    throw AppError.conflict(
+      `Barcode ${barcode} is already assigned to ${productClash.name} (${productClash.sku})`,
+      { barcode },
+    );
+  }
+
+  const [enrolledClash] = await db
+    .select({ name: products.name, sku: products.sku })
+    .from(productScanProfiles)
+    .innerJoin(products, eq(products.id, productScanProfiles.productId))
+    .where(
+      and(
+        eq(productScanProfiles.shopId, shopId),
+        eq(productScanProfiles.barcode, barcode),
+        ...(excludeProductId ? [ne(productScanProfiles.productId, excludeProductId)] : []),
+      ),
+    )
+    .limit(1);
+  if (enrolledClash) {
+    throw AppError.conflict(
+      `Barcode ${barcode} is already enrolled for ${enrolledClash.name} (${enrolledClash.sku})`,
+      { barcode },
+    );
+  }
+
+  return barcode;
+}
+
 /** Uppercase slug from product name for SKU (A–Z, 0–9, hyphens). */
 export function slugifySkuBase(name: string): string {
   const s = name
@@ -852,7 +926,10 @@ export async function createProduct(
     }
   }
 
-  let barcode = input.barcode?.trim() || null;
+  // Merchant-supplied codes must be shop-unique; the check runs before the insert so the 409 names
+  // the product that already owns the code. Generated codes skip the lookup — twelve random digits,
+  // with the unique index plus the 23505 mapping in `app.ts` as the safety net.
+  let barcode = await assertBarcodeAvailable(shopId, input.barcode);
   if (!barcode && input.autoBarcode !== false) {
     barcode = generateBarcode();
   }
@@ -1135,6 +1212,12 @@ export async function updateProduct(
 
   const nextPatch: typeof patch = { ...patch };
 
+  // Barcode lands straight in the row, so trim it (blank = no barcode) and pre-check the
+  // shop-unique index here as well: the full edit form PATCHes barcode, not only the inline editor.
+  if (patch.barcode !== undefined) {
+    nextPatch.barcode = await assertBarcodeAvailable(shopId, patch.barcode, productId);
+  }
+
   if (patch.website !== undefined) {
     const currentMeta =
       existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
@@ -1219,6 +1302,195 @@ export async function getProductByBarcode(shopId: string, barcode: string) {
     )
     .limit(1);
   return row ?? null;
+}
+
+// ─── Barcode maintenance (Inventory → Barcodes) ──────────────────────────────
+
+export type BarcodeStatusFilter = 'ALL' | 'WITH' | 'WITHOUT';
+
+/** "Does this product have quantity?" filter for the barcode screen. */
+export type BarcodeStockFilter = 'IN_STOCK' | 'OUT_OF_STOCK';
+
+/** Longest barcode accepted from the merchant-facing barcode screens. */
+const BARCODE_MAX_LENGTH = 128;
+
+/**
+ * A barcode counts as "present" only when it has a non-blank value. Kept identical to the
+ * `ux_products_shop_barcode` partial index predicate, so "no barcode" rows are exactly the rows the
+ * index ignores.
+ */
+const barcodeIsPresent = sql`(${products.barcode} is not null and btrim(${products.barcode}) <> '')`;
+
+export type BarcodeAuditRow = {
+  id: string;
+  sku: string;
+  name: string;
+  barcode: string | null;
+  trackingMode: string;
+  isBundle: boolean;
+  /**
+   * Units on hand across **every** stock location, or `null` when the app does not measure this
+   * product (bundle, or a quantity product with inventory tracking off).
+   */
+  quantityOnHand: string | null;
+};
+
+/**
+ * On-hand for the barcode screen.
+ *
+ * Quantity products read `inventory_balances` summed over every location; serialized products count
+ * `device_units` still in stock and not blocklisted — the same two sources the product list uses,
+ * but shop-wide, because this screen has no location picker and "do I still have any of this?" is a
+ * shop-level question. A bundle and an untracked quantity product answer `null`, never `0`: `0` is a
+ * number the app would be inventing, since neither has a stock figure at all.
+ */
+const barcodeOnHandExpr = sql<string | null>`
+  (case
+     when ${products.isBundle} then null::numeric
+     when ${products.trackingMode} = 'SERIALIZED' then coalesce((
+       select count(*)::numeric
+       from   device_units du
+       where  du.shop_id = "products"."shop_id"
+         and  du.product_id = "products"."id"
+         and  du.status = 'IN_STOCK'
+         and  du.blocklisted = false
+     ), 0)
+     when ${products.inventoryTracked} then coalesce((
+       select sum(ib.quantity::numeric)
+       from   inventory_balances ib
+       where  ib.shop_id = "products"."shop_id"
+         and  ib.product_id = "products"."id"
+     ), 0)
+     else null::numeric
+   end)`;
+
+/**
+ * One row per product with its current barcode, for the fast barcode-entry screen.
+ *
+ * Row order puts barcodes **missing first** (then name), so the merchant types one code after the
+ * next without hunting for the empty rows. `counts` is computed with the same search / tracked /
+ * stock filters but ignores the has/has-not tab, so the tab badges stay meaningful.
+ */
+export async function listProductsForBarcodeAudit(
+  shopId: string,
+  q: {
+    status?: BarcodeStatusFilter;
+    search?: string;
+    inventoryTracked?: boolean;
+    /** When set, keep only products with measured quantity (`IN_STOCK`) or without it (`OUT_OF_STOCK`). */
+    stock?: BarcodeStockFilter;
+    limit: number;
+    offset: number;
+  },
+): Promise<{
+  items: BarcodeAuditRow[];
+  counts: { total: number; withBarcode: number; withoutBarcode: number };
+  hasMore: boolean;
+}> {
+  const base = [eq(products.shopId, shopId), eq(products.active, true)];
+
+  const search = q.search?.trim();
+  if (search) {
+    const s = `%${search}%`;
+    base.push(or(ilike(products.name, s), ilike(products.sku, s), ilike(products.barcode, s))!);
+  }
+  if (q.inventoryTracked === true) {
+    base.push(or(eq(products.trackingMode, 'SERIALIZED'), eq(products.inventoryTracked, true))!);
+  }
+
+  if (q.stock) {
+    // "Has quantity?" is only answerable for stock the app actually measures: a bundle owns no
+    // stock and a quantity product with tracking off has no balance row, so both would look
+    // permanently empty. Same narrowing the product list applies when a stock filter is active.
+    base.push(or(eq(products.trackingMode, 'SERIALIZED'), eq(products.inventoryTracked, true))!);
+    base.push(eq(products.isBundle, false));
+    base.push(
+      q.stock === 'IN_STOCK' ? sql`${barcodeOnHandExpr} > 0` : sql`${barcodeOnHandExpr} <= 0`,
+    );
+  }
+
+  const filtered = [...base];
+  if (q.status === 'WITH') filtered.push(sql`${barcodeIsPresent}`);
+  else if (q.status === 'WITHOUT') filtered.push(sql`not ${barcodeIsPresent}`);
+
+  const [countsRow] = await db
+    .select({
+      total: count(),
+      withBarcode: sql<number>`count(*) filter (where ${barcodeIsPresent})::int`,
+    })
+    .from(products)
+    .where(and(...base));
+
+  const rows = await db
+    .select({
+      id: products.id,
+      sku: products.sku,
+      name: products.name,
+      barcode: products.barcode,
+      trackingMode: products.trackingMode,
+      isBundle: products.isBundle,
+      quantityOnHand: barcodeOnHandExpr,
+    })
+    .from(products)
+    .where(and(...filtered))
+    .orderBy(sql`case when ${barcodeIsPresent} then 1 else 0 end`, sql`lower(${products.name})`)
+    .limit(q.limit)
+    .offset(q.offset);
+
+  const total = Number(countsRow?.total ?? 0);
+  const withBarcode = Number(countsRow?.withBarcode ?? 0);
+
+  return {
+    items: rows.map((r) => ({
+      id: r.id,
+      sku: r.sku,
+      name: r.name,
+      barcode: r.barcode,
+      trackingMode: r.trackingMode,
+      isBundle: r.isBundle,
+      quantityOnHand: r.quantityOnHand === null ? null : String(r.quantityOnHand),
+    })),
+    counts: { total, withBarcode, withoutBarcode: total - withBarcode },
+    hasMore: rows.length === q.limit,
+  };
+}
+
+/**
+ * Set (or clear) one product's barcode.
+ *
+ * Blank input clears the field instead of storing `''` — the partial unique index skips blanks, so
+ * clearing can never collide. Duplicates are pre-checked to name the product that already owns the
+ * code; a racing duplicate is still caught by the index and reported as a conflict, never a 500.
+ */
+export async function setProductBarcode(
+  shopId: string,
+  productId: string,
+  rawBarcode: string | null,
+) {
+  const [existing] = await db
+    .select({ id: products.id })
+    .from(products)
+    .where(and(eq(products.id, productId), eq(products.shopId, shopId)))
+    .limit(1);
+  if (!existing) throw AppError.notFound('Product not found');
+
+  // Trim, length-check and reject a code another product already owns (or has enrolled as a
+  // packet) — the same guard the create and full-edit paths run.
+  const barcode = await assertBarcodeAvailable(shopId, rawBarcode, productId);
+
+  try {
+    const [row] = await db
+      .update(products)
+      .set({ barcode, updatedAt: new Date() })
+      .where(and(eq(products.id, productId), eq(products.shopId, shopId)))
+      .returning();
+    return row!;
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      throw AppError.conflict('This barcode is already used by another product', { barcode });
+    }
+    throw e;
+  }
 }
 
 export async function setBundleItems(

@@ -3,6 +3,7 @@ import { db } from '../db/client.js';
 import {
   brands,
   categories,
+  productReviews,
   productWebsiteImages,
   productWebsiteProfiles,
   products,
@@ -190,6 +191,8 @@ export async function listPublicProducts(
       featured: productWebsiteProfiles.featured,
       sortOrder: productWebsiteProfiles.sortOrder,
       coverUrl: sql<string | null>`(select url from ${productWebsiteImages} i where i.shop_id = ${products.shopId} and i.product_id = ${products.id} and i.kind = 'COVER' and i.is_active = true order by i.sort_order asc, i.created_at desc limit 1)`,
+      avgRating: sql<number | null>`(select round(avg(r.rating)::numeric, 1)::float from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
+      reviewCount: sql<number>`(select count(*)::int from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
     })
     .from(products)
     .innerJoin(
@@ -217,6 +220,8 @@ export async function listPublicProducts(
       shortDescription: r.shortDescription ?? null,
       featured: r.featured === true,
       coverImageUrl: normalizeShopAssetUrl(r.coverUrl ?? null, slug),
+      avgRating: r.avgRating ?? null,
+      reviewCount: r.reviewCount ?? 0,
     })),
   };
 }
@@ -250,6 +255,8 @@ export async function getPublicProductBySlug(shopSlug: string, productSlug: stri
       canonicalUrl: productWebsiteProfiles.canonicalUrl,
       visible: productWebsiteProfiles.visible,
       featured: productWebsiteProfiles.featured,
+      avgRating: sql<number | null>`(select round(avg(r.rating)::numeric, 1)::float from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
+      reviewCount: sql<number>`(select count(*)::int from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
     })
     .from(products)
     .innerJoin(
@@ -322,6 +329,8 @@ export async function getPublicProductBySlug(shopSlug: string, productSlug: stri
     tags: row.tags ?? null,
     canonicalUrl: row.canonicalUrl ?? null,
     featured: row.featured === true,
+    avgRating: row.avgRating ?? null,
+    reviewCount: row.reviewCount ?? 0,
     images: images.map((im) => ({ ...im, url: normalizeShopAssetUrl(im.url, slug) ?? im.url })),
   };
 }
@@ -355,6 +364,8 @@ export async function getPublicProductById(shopSlug: string, productId: string) 
       canonicalUrl: productWebsiteProfiles.canonicalUrl,
       visible: productWebsiteProfiles.visible,
       featured: productWebsiteProfiles.featured,
+      avgRating: sql<number | null>`(select round(avg(r.rating)::numeric, 1)::float from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
+      reviewCount: sql<number>`(select count(*)::int from ${productReviews} r where r.shop_id = ${products.shopId} and r.product_id = ${products.id} and r.status = 'APPROVED')`,
     })
     .from(products)
     .innerJoin(
@@ -424,6 +435,8 @@ export async function getPublicProductById(shopSlug: string, productId: string) 
     tags: row.tags ?? null,
     canonicalUrl: row.canonicalUrl ?? null,
     featured: row.featured === true,
+    avgRating: row.avgRating ?? null,
+    reviewCount: row.reviewCount ?? 0,
     images: images.map((im) => ({ ...im, url: normalizeShopAssetUrl(im.url, slug) ?? im.url })),
   };
 }
